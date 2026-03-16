@@ -1,0 +1,25 @@
+{
+  "name": "pi-tg",
+  "version": "0.1.0",
+  "description": "Always-on Telegram bot backed by pi — persistent history, multi-agent routing, proactive scheduler",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx --watch src/main.ts",
+    "start": "node --import tsx/esm src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.58.3",
+    "@mariozechner/pi-agent-core": "0.58.3",
+    "@mariozechner/pi-ai": "0.58.3",
+    "@sinclair/typebox": "^0.34.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.0.0"
+  }
+}
