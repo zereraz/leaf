@@ -2,7 +2,7 @@
  * scheduler.ts — proactive engagement modes.
  * Runs inside the bot process on setInterval. Checks IST time + cooldowns.
  */
-import { SCHEDULER, SILENT_TOKEN, MAIN_CONVERSATION, type SchedulerMode } from "./config.js";
+import { SCHEDULER, SILENT_TOKEN, type SchedulerMode } from "./config.js";
 import { readState, updateState } from "./store.js";
 import { runProactive } from "./agent.js";
 import {
@@ -26,14 +26,12 @@ function istWeek(): string {
 }
 
 function cooldownOk(mode: SchedulerMode): boolean {
-  const state = readState();
-  const last = state.schedulerLastRun[mode] ?? 0;
+  const last = readState().schedulerLastRun[mode] ?? 0;
   return (Date.now() - last) >= SCHEDULER.cooldowns[mode] * 1000;
 }
 
 function lastKey(mode: SchedulerMode): string {
-  const state = readState();
-  return (state.schedulerLastRun[`${mode}:key`] as unknown as string) ?? "";
+  return (readState().schedulerLastRun[`${mode}:key`] as unknown as string) ?? "";
 }
 
 function markRan(mode: SchedulerMode, key: string): void {
@@ -158,14 +156,8 @@ async function tick(): Promise<void> {
   }
 
   console.log(`[scheduler] Running: ${mode}`);
-  const prompt = promptFor(mode);
-
-  const state = readState();
-  const mainMeta = state.conversations[MAIN_CONVERSATION];
-  if (!mainMeta) { console.error("[scheduler] No main conversation"); return; }
-
   try {
-    await runProactive(mainMeta, Object.keys(state.conversations), prompt);
+    await runProactive(promptFor(mode));
     markRan(mode, mode === "stale_review" ? istWeek() : istDate());
   } catch (err) {
     console.error(`[scheduler] ${mode} error:`, err);
@@ -185,10 +177,6 @@ export function stopScheduler(): void {
   if (timer) { clearInterval(timer); timer = null; }
 }
 
-/** Force a specific mode for testing. */
 export async function forceMode(mode: SchedulerMode): Promise<void> {
-  const state = readState();
-  const mainMeta = state.conversations[MAIN_CONVERSATION];
-  if (!mainMeta) throw new Error("No main conversation");
-  await runProactive(mainMeta, Object.keys(state.conversations), promptFor(mode));
+  await runProactive(promptFor(mode));
 }

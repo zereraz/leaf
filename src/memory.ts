@@ -63,7 +63,7 @@ function findGitDirs(bases: readonly string[], maxDepth = 3): string[] {
         `fd -t d -d ${maxDepth} --hidden "^\\.git$" "${base}"`,
         { encoding: "utf-8", timeout: 10_000 },
       );
-      results.push(...out.trim().split("\n").filter(Boolean).map(p => p.replace(/\/.git$/, "")));
+      results.push(...out.trim().split("\n").filter(Boolean).map(p => p.replace(/\/?\.git\/?$/, "")));
     } catch { /* skip unreadable bases */ }
   }
   return results;

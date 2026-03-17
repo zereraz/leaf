@@ -33,6 +33,9 @@ if (forceModeArg) {
 startScheduler();
 void startBot(); // long-polls forever — returns only when stopBot() is called
 
+// Startup notification
+notifyOwner("👋 pi-tg online").catch(() => {});
+
 // ── Graceful shutdown ───────────────────────────────────────────────────────
 function shutdown(signal: string): void {
   console.log(`[pi-tg] ${signal}. Shutting down.`);

@@ -7,6 +7,8 @@ import { join } from "node:path";
 
 const HOME = homedir();
 
+const PI_TG_HOME = join(HOME, "pi-tg");
+
 export const TG = {
   botToken: process.env["TG_BOT_TOKEN"] ?? "REDACTED",
   ownerChatId: Number(process.env["TG_CHAT_ID"] ?? REDACTED_CHAT_ID),
@@ -17,12 +19,13 @@ export const TG = {
 
 export const PATHS = {
   home: HOME,
-  data: join(HOME, ".pi", "tg"),
-  agentDir: join(HOME, ".pi", "agent"),
-  projects: join(HOME, "clawd/memory/projects.md"),
-  memory: join(HOME, "clawd/MEMORY.md"),
-  user: join(HOME, "clawd/USER.md"),
-  dailyLogs: join(HOME, "clawd/memory"),
+  piTgHome: PI_TG_HOME,
+  data: join(PI_TG_HOME, "data"),
+  agentDir: join(HOME, ".pi", "agent"),       // auth/models — shared with pi coding agent
+  projects: join(PI_TG_HOME, "memory", "projects.md"),
+  memory: join(PI_TG_HOME, "MEMORY.md"),
+  user: join(PI_TG_HOME, "USER.md"),
+  dailyLogs: join(PI_TG_HOME, "memory"),
   igne: join(HOME, "Library/Mobile Documents/com~apple~CloudDocs/igne/cloud-v1"),
   codeDirs: [join(HOME, "Code/Zereraz"), join(HOME, "Code/Juspay")],
 } as const;
