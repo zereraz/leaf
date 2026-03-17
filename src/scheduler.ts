@@ -5,6 +5,7 @@
 import { SCHEDULER, SILENT_TOKEN, type SchedulerMode } from "./config.js";
 import { readState, updateState } from "./store.js";
 import { runProactive } from "./agent.js";
+import { gatherContext, readContextBrief } from "./context-agent.js";
 import {
   readProjects, readIgneIndex, readIgneFile, readTodayLog,
   recentGitActivity, hottestRepo, allRepoActivity, gitLog, gitDiffStat,
@@ -73,76 +74,61 @@ function pickMode(): SchedulerMode | null {
 // ── Prompts ────────────────────────────────────────────────────────────────
 
 function promptFor(mode: SchedulerMode): string {
+  // Context brief is always fresh (gathered just before this call in tick())
+  const context = readContextBrief();
+
   switch (mode) {
-    case "morning_brief": {
-      const activity = recentGitActivity(7).map(r => `- ${r.name} (${r.commitCount}): ${r.lastCommit}`).join("\n");
-      return `[SCHEDULER:morning_brief] Morning brief.
+    case "morning_brief":
+      return `[SCHEDULER:morning_brief] Morning brief for saheb.
 
-Git activity (7d):
-${activity || "(none)"}
+## What he's been working on
+${context}
 
-Projects:
-${readProjects()}
+Pick the ONE thing with most momentum right now. Say what it is, why it matters today, one concrete next step. 3 lines max. Plain text. ${SILENT_TOKEN} if nothing genuine.`;
 
-3-4 lines: the one project with most momentum, one concrete thing worth doing today. Plain text. ${SILENT_TOKEN} if nothing.`;
-    }
+    case "pulse":
+      return `[SCHEDULER:pulse] Check in on what saheb is currently building.
 
-    case "pulse": {
-      const repo = hottestRepo();
-      if (!repo) return `[SCHEDULER:pulse] ${SILENT_TOKEN}`;
-      const commits = gitLog(repo.path, 8);
-      const diff = gitDiffStat(repo.path);
-      return `[SCHEDULER:pulse] Project pulse: ${repo.name} (${repo.commitCount} recent commits)
+## Current focus synthesis
+${context}
 
-Commits:
-${commits}
-${diff ? `\nChanges: ${diff}` : ""}
-
-Context:
-${readProjects().split("\n").filter(l => l.toLowerCase().includes(repo.name.toLowerCase())).slice(0, 8).join("\n") || "(no notes)"}
-
-2-3 lines: what's the current direction, any open question or next step. Plain text. ${SILENT_TOKEN} if nothing specific.`;
-    }
+Surface the most interesting thing happening right now — the actual direction, an open question, or what the next decision probably is. 2-3 lines. ${SILENT_TOKEN} if nothing specific stands out.`;
 
     case "igne_surface": {
-      const activity = recentGitActivity(14).map(r => r.name).join(", ");
-      return `[SCHEDULER:igne_surface] Surface one igne note relevant to current work.
+      const ideas = readIgneFile("ideas.md");
+      const igneIndex = readIgneIndex();
+      return `[SCHEDULER:igne_surface] Surface one igne note that connects to what saheb is doing.
 
-Igne index:
-${readIgneIndex()}
+## Current focus
+${context}
 
-Ideas note:
-${readIgneFile("ideas.md")}
+## Igne notes index
+${igneIndex}
 
-Active projects: ${activity}
+## Ideas note
+${ideas}
 
-Pick ONE note. Quote its key line. 1-2 sentences connecting it to current work. 3-4 lines total. ${SILENT_TOKEN} if no genuine connection.`;
+Pick ONE igne note that genuinely connects to his current work. Quote the key line. Explain the connection in 1-2 sentences. ${SILENT_TOKEN} if nothing genuine.`;
     }
 
-    case "evening_wrap": {
-      const activity = recentGitActivity(1).map(r => `${r.name}: ${r.lastCommit}`).join("\n");
+    case "evening_wrap":
       return `[SCHEDULER:evening_wrap] Evening check-in.
 
-Today's git activity:
-${activity || "(no commits today)"}
+## What happened today
+${context}
 
-Today's log:
-${readTodayLog()}
+Reflect on what was built or decided today. Something specific worth capturing, or a question about tomorrow. 2 lines. ${SILENT_TOKEN} if nothing.`;
 
-1-2 lines reflecting on today — what shipped, anything worth capturing, or a gentle nudge. ${SILENT_TOKEN} if nothing.`;
-    }
+    case "stale_review":
+      return `[SCHEDULER:stale_review] Weekly: anything gone cold that saheb probably intended to continue?
 
-    case "stale_review": {
-      return `[SCHEDULER:stale_review] Weekly stale project review.
+## Current focus (what's active)
+${context}
 
-All repos:
+## All repos
 ${allRepoActivity()}
 
-Projects brain:
-${readProjects()}
-
-1-2 projects: no commits in 3+ weeks but appear in projects brain as ongoing. Ask "still in play?" for each. ${SILENT_TOKEN} if all is intentional.`;
-    }
+1-2 projects: cold (3+ weeks) but probably still relevant. Ask "still in play?" Specific, not generic. ${SILENT_TOKEN} if nothing concerning.`;
   }
 }
 
@@ -156,6 +142,11 @@ async function tick(): Promise<void> {
   }
 
   console.log(`[scheduler] Running: ${mode}`);
+
+  // Refresh context brief before crafting proactive message
+  // so the main agent has real synthesis of what saheb is doing
+  await gatherContext().catch(err => console.warn("[scheduler] context gather failed:", err));
+
   try {
     await runProactive(promptFor(mode));
     markRan(mode, mode === "stale_review" ? istWeek() : istDate());

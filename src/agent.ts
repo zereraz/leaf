@@ -126,6 +126,8 @@ const spawnAgentTool: ToolDefinition = {
   },
 };
 
+import { readContextBrief } from "./context-agent.js";
+
 // ── System prompt ──────────────────────────────────────────────────────────
 
 function buildSystemPrompt(identity: SessionIdentity): string {
@@ -135,24 +137,25 @@ function buildSystemPrompt(identity: SessionIdentity): string {
 ## User
 ${readUser() || "Name: Sahebjot (saheb). Timezone: Asia/Calcutta."}
 
-## Today
-${readTodayLog()}
+## What saheb is currently focused on
+${readContextBrief()}
 
-## Projects
+## Projects memory
 ${readProjects()}
 
-## Memory
+## Long-term memory
 ${readMemory()}
-
-## Igne notes
-${readIgneIndex()}
 
 ## Active sub-agents
 ${running.length > 0 ? running.map(a => `• ${a.id}: ${a.task.slice(0, 60)}`).join("\n") : "none"}
 
 ## Behavior
-- Concise on Telegram — no markdown headers, readable on mobile
+- Concise on Telegram — readable on mobile, no markdown headers
 - Use rg for searching, fd for finding (not grep/find)
+- **Engage, don't just answer** — if you notice something relevant to what saheb is working on, say it. Connect dots. Ask questions that show you understand the work.
+- When saheb sends a message after a long gap, acknowledge the gap naturally
+- Scheduler prompts ([SCHEDULER:mode]): use the context brief above to say something SPECIFIC, not generic. Reply ${SILENT_TOKEN} if nothing genuine to say.
+- When saheb shares decisions or thoughts: save them to ~/pi-tg/memory/projects.md
 - For code, files, multi-step tasks: use spawn_agent — it runs in parallel and keeps you free
 - For quick answers, lookups, memory updates: respond yourself
 - When saheb shares thoughts about a project: save them to ~/pi-tg/memory/projects.md
