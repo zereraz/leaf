@@ -1,97 +1,162 @@
 /**
  * bot.ts — Telegram long-polling loop.
  *
- * - Only accepts messages from the owner chat ID
- * - Deduplicates by update_id (persisted in log)
- * - Per-conversation mutex: queues concurrent messages, runs serially
- * - Exponential backoff on conflict errors (another poller running)
- * - Typing indicator kept alive during long runs
+ * Responsibilities:
+ *  - Poll getUpdates, deduplicate by update_id
+ *  - Commands → instant reply (no agent)
+ *  - Messages → runMessage() with streaming placeholder
+ *  - Exponential backoff on conflict/network errors
+ *  - ⌛ reaction while working, ✅ when done
  */
 import { TG } from "./config.js";
-import { getUpdates, sendMessage, sendTyping, notifyOwner, TgApiError, type TgUpdate } from "./telegram.js";
+import {
+  getUpdates, sendMessage, sendPlaceholder, editMessage, sendTyping,
+  setReaction, copyButton, notifyOwner, TgApiError,
+  type TgUpdate,
+} from "./telegram.js";
 import { appendLog, seenUpdateIds, updateState, readState } from "./store.js";
 import { route } from "./router.js";
-import { runMessage } from "./agent.js";
-
-// ── Mutex: one run per conversation at a time ──────────────────────────────
-
-const running = new Map<string, boolean>();
-const queue = new Map<string, Array<() => Promise<void>>>();
-
-async function withMutex(conversation: string, fn: () => Promise<void>): Promise<void> {
-  const q = queue.get(conversation) ?? [];
-  queue.set(conversation, q);
-
-  q.push(fn);
-
-  if (running.get(conversation)) return; // will be picked up when current run ends
-
-  running.set(conversation, true);
-  while (q.length > 0) {
-    const next = q.shift()!;
-    try { await next(); } catch (err) { console.error(`[bot:${conversation}] run error:`, err); }
-  }
-  running.set(conversation, false);
-}
+import { runMessage, formatToolCall, formatToolResult } from "./agent.js";
 
 // ── Update handler ─────────────────────────────────────────────────────────
 
 async function handleUpdate(update: TgUpdate): Promise<void> {
   const msg = update.message;
   if (!msg?.text) return;
-  if (msg.chat.id !== TG.ownerChatId) {
-    console.log(`[bot] Ignored message from chat ${msg.chat.id}`);
+  if (msg.chat.id !== TG.ownerChatId) return;
+
+  const chatId    = msg.chat.id;
+  const userMsgId = msg.message_id;
+  const text      = msg.text.trim();
+  const ts        = msg.date * 1000;
+  const updateId  = update.update_id;
+
+  // Commands — no agent, reply immediately
+  const routed = route(text);
+  if (routed.kind === "command_reply") {
+    await sendMessage(chatId, routed.text);
     return;
   }
 
-  const chatId = msg.chat.id;
-  const text = msg.text.trim();
-  const ts = msg.date * 1000;
-  const updateId = update.update_id;
-
-  // Route first (commands don't need dedup or agent)
-  const result = route(text);
-
-  if (result.kind === "command_reply") {
-    await sendMessage(chatId, result.text);
+  // Dedup — skip if already processed
+  if (seenUpdateIds().has(updateId)) {
+    console.log(`[bot] Dedup: update ${updateId}`);
     return;
   }
 
-  const { conversation, allConversations } = result;
+  // Persist immediately — dedup is based on this
+  await appendLog({ date: new Date(ts).toISOString(), ts, role: "user", text, updateId, messageId: userMsgId });
 
-  // Dedup: skip if we've already processed this update
-  const seen = seenUpdateIds(conversation.name);
-  if (seen.has(updateId)) {
-    console.log(`[bot] Dedup: update ${updateId} already processed`);
-    return;
-  }
+  // Streaming run — agent.ts holds the in-process + file lock
+  const EDIT_INTERVAL_MS = 400;
+  const NEAR_MAX = 3700;
 
-  // Log immediately so dedup works even if agent crashes
-  await appendLog(conversation.name, { date: new Date(ts).toISOString(), ts, role: "user", text, updateId });
+  let activeMsgId: number | null = null;
+  let committedChars = 0;
+  let latestContent = "";
+  let lastEditedText = "";
+  let showingToolStatus = false;
+  const toolLog: string[] = [];
+  let activeTool = "";
+  let draftTimer: NodeJS.Timeout | null = null;
+  let typingTimer: NodeJS.Timeout | null = null;
+  let firstEditDone = false;
 
-  await withMutex(conversation.name, async () => {
-    let typingTimer: NodeJS.Timeout | null = null;
-    typingTimer = setInterval(() => void sendTyping(chatId), 4_000);
-    await sendTyping(chatId);
+  const buildDisplay = (): string => {
+    if (latestContent.length > 0) return latestContent;
+    const lines = [...toolLog];
+    if (activeTool) lines.push(activeTool);
+    return lines.join("\n");
+  };
+
+  await setReaction(chatId, userMsgId, "⌛");
+  activeMsgId = await sendPlaceholder(chatId, userMsgId);
+  typingTimer = setInterval(() => void sendTyping(chatId), 4_000);
+  await sendTyping(chatId);
+
+  const flushEdit = async () => {
+    const hasText = latestContent.length > 0;
+    if (showingToolStatus && hasText) {
+      showingToolStatus = false;
+      lastEditedText = "";
+      committedChars = 0;
+    }
+    const display = buildDisplay();
+    if (!display) return;
+    if (!hasText) showingToolStatus = true;
+
+    const chunk = display.slice(committedChars);
+    if (!chunk || chunk === lastEditedText) return;
+
+    if (!firstEditDone) {
+      firstEditDone = true;
+      if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+    }
+
+    if (chunk.length <= NEAR_MAX) {
+      await editMessage(chatId, activeMsgId!, chunk);
+      lastEditedText = chunk;
+    } else {
+      await editMessage(chatId, activeMsgId!, chunk.slice(0, NEAR_MAX));
+      committedChars += NEAR_MAX;
+      activeMsgId = await sendPlaceholder(chatId);
+      lastEditedText = "";
+    }
+  };
+
+  draftTimer = setInterval(() => void flushEdit(), EDIT_INTERVAL_MS);
+
+  try {
+    const { text: response } = await runMessage(
+      text, ts,
+      { chatId, replyToMsgId: userMsgId },
+      (accumulated) => { latestContent = accumulated; },
+      (toolName, args) => { activeTool = formatToolCall(toolName, args); },
+      (toolName, args, result) => { toolLog.push(formatToolResult(toolName, args, result)); activeTool = ""; },
+    );
+
+    clearInterval(draftTimer); draftTimer = null;
+    if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+
+    if (!response) {
+      await editMessage(chatId, activeMsgId!, "\u200b"); // zero-width space
+      await setReaction(chatId, userMsgId, null);
+      return;
+    }
+
+    const finalCommitted = showingToolStatus ? 0 : committedChars;
+    const remaining = response.slice(finalCommitted);
 
     try {
-      const { text: response } = await runMessage(conversation, allConversations, text, ts);
-      clearInterval(typingTimer);
-      typingTimer = null;
-
-      if (!response) return;
-
-      const now = Date.now();
-      await appendLog(conversation.name, { date: new Date(now).toISOString(), ts: now, role: "bot", text: response });
-      await sendMessage(chatId, response);
-
-      console.log(`[bot:${conversation.name}] Replied (${response.length} chars)`);
-    } catch (err) {
-      if (typingTimer) clearInterval(typingTimer);
-      console.error(`[bot:${conversation.name}] Agent error:`, err);
-      await sendMessage(chatId, "⚠️ Something went wrong. Check logs.").catch(() => {});
+      if (remaining.length <= NEAR_MAX) {
+        await editMessage(chatId, activeMsgId!, remaining, { reply_markup: copyButton(response) });
+      } else {
+        await editMessage(chatId, activeMsgId!, remaining.slice(0, NEAR_MAX));
+        let rest = remaining.slice(NEAR_MAX);
+        while (rest.length > NEAR_MAX) {
+          await sendMessage(chatId, rest.slice(0, NEAR_MAX));
+          rest = rest.slice(NEAR_MAX);
+        }
+        await sendMessage(chatId, rest, { reply_markup: copyButton(response) });
+      }
+    } catch (editErr) {
+      // Final edit failed — send fresh so response is never lost
+      console.error("[bot] Final edit failed, fallback send:", (editErr as Error).message);
+      await sendMessage(chatId, remaining.slice(0, NEAR_MAX)).catch(() => {});
     }
-  });
+
+    await setReaction(chatId, userMsgId, "✅");
+    const now = Date.now();
+    await appendLog({ date: new Date(now).toISOString(), ts: now, role: "bot", text: response });
+    console.log(`[bot] Replied (${response.length} chars)`);
+
+  } catch (err) {
+    if (draftTimer) clearInterval(draftTimer);
+    if (typingTimer) clearInterval(typingTimer);
+    console.error("[bot] Agent error:", err);
+    await setReaction(chatId, userMsgId, "⚠️").catch(() => {});
+    await sendMessage(chatId, "⚠️ Something went wrong.").catch(() => {});
+  }
 }
 
 // ── Poll loop ──────────────────────────────────────────────────────────────
@@ -103,27 +168,35 @@ export async function startBot(): Promise<void> {
   polling = true;
 
   let backoffMs = 1_000;
+  let wasOffline = false;
+  let offlineSince = 0;
 
   while (polling) {
-    const state = readState();
     try {
-      const updates = await getUpdates(state.offset, TG.pollTimeoutSecs);
-      backoffMs = 1_000; // reset on success
+      const updates = await getUpdates(readState().offset, TG.pollTimeoutSecs);
+      backoffMs = 1_000;
+
+      if (wasOffline) {
+        wasOffline = false;
+        const down = Math.round((Date.now() - offlineSince) / 1000);
+        const downStr = down < 60 ? `${down}s` : `${Math.round(down / 60)}m`;
+        console.log("[bot] Back online.");
+        await notifyOwner(`🟢 Back online. (down ${downStr})`).catch(() => {});
+      }
 
       for (const update of updates) {
-        // Advance offset before processing — safe on restart
         updateState(s => { s.offset = update.update_id + 1; });
         await handleUpdate(update);
       }
     } catch (err) {
       if (err instanceof TgApiError && err.isConflict()) {
-        // Another poller is running. Back off.
-        console.warn(`[bot] Conflict: another poller detected. Backing off ${backoffMs}ms…`);
+        console.warn(`[bot] Conflict: backing off ${backoffMs}ms…`);
         await sleep(backoffMs);
         backoffMs = Math.min(backoffMs * 2, 60_000);
       } else {
-        console.error("[bot] Poll error:", err);
-        await sleep(5_000);
+        if (!wasOffline) { wasOffline = true; offlineSince = Date.now(); console.warn("[bot] Offline:", (err as Error).message?.slice(0, 80)); }
+        await sleep(Math.min(backoffMs, 15_000));
+        backoffMs = Math.min(backoffMs * 2, 60_000);
       }
     }
   }
