@@ -1,13 +1,13 @@
 /**
  * agent.ts — pi SDK session management.
  *
- * One AgentSession per conversation, each backed by its own context.jsonl.
- * Auth via pi's standard AuthStorage — reads ~/.pi/agent/auth.json
- * plus env vars (AWS_BEARER_TOKEN_BEDROCK, AWS_ACCESS_KEY_ID, etc.).
+ * One persistent AgentSession for the main Telegram conversation.
+ * Sub-agents use getOrCreateSession() directly with their own identity.
+ *
+ * Auth via pi's standard AuthStorage (env vars: AWS_BEARER_TOKEN_BEDROCK etc.)
  * System prompt rebuilt fresh on every run from memory files.
  */
 import { join } from "node:path";
-import { mkdirSync } from "node:fs";
 import {
   createAgentSession,
   AuthStorage,
@@ -17,15 +17,34 @@ import {
   codingTools,
   DefaultResourceLoader,
   type AgentSession,
+  type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
-import { PATHS, SILENT_TOKEN } from "./config.js";
-import type { ConversationMeta } from "./store.js";
-import { contextFile, ensureDirs } from "./store.js";
+import { Type, type Static } from "@sinclair/typebox";
+import { PATHS, MAIN_CONVERSATION, SILENT_TOKEN } from "./config.js";
+import { sessionFile, PI_SESSIONS_DIR, initStore } from "./store.js";
 import { syncLogToContext } from "./context.js";
-import {
-  readProjects, readMemory, readUser, readIgneIndex, readTodayLog,
-} from "./memory.js";
+import { readProjects, readMemory, readUser, readIgneIndex, readTodayLog } from "./memory.js";
 import { notifyOwner } from "./telegram.js";
+import { acquireFileLock } from "./lock.js";
+import { spawnSubAgent, activeSubAgents } from "./subagent.js";
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+export interface SessionIdentity {
+  readonly name: string;       // e.g. "main" or "subagent-eidos"
+  readonly description: string;
+  readonly cwd?: string;       // project dir override
+}
+
+export interface RunResult {
+  readonly text: string;
+}
+
+// The main conversation identity — always the same
+export const MAIN: SessionIdentity = {
+  name: MAIN_CONVERSATION,
+  description: "Primary assistant",
+};
 
 // ── Session cache ──────────────────────────────────────────────────────────
 
@@ -36,175 +55,258 @@ interface CachedSession {
 
 const cache = new Map<string, CachedSession>();
 
-// ── System prompt ──────────────────────────────────────────────────────────
-
-function buildSystemPrompt(meta: ConversationMeta, allConversations: string[]): string {
-  const user = readUser();
-  const projects = readProjects();
-  const memory = readMemory();
-  const today = readTodayLog();
-  const igne = readIgneIndex();
-  const otherConvs = allConversations.filter(c => c !== meta.name);
-
-  return `You are pi — saheb's always-on AI companion running as a Telegram bot.
-Conversation: "${meta.name}" — ${meta.description}
-
-## User
-${user || "Name: Sahebjot (saheb). Timezone: Asia/Calcutta."}
-
-## This session
-You are running in conversation "${meta.name}".${meta.cwd ? `\nWorking directory: ${meta.cwd}` : ""}
-${otherConvs.length > 0 ? `\nOther active conversations: ${otherConvs.join(", ")}` : ""}
-
-## Today
-${today}
-
-## Projects
-${projects}
-
-## Long-term memory
-${memory}
-
-## Igne notes index
-${igne}
-
-## Behavior
-- Concise on Telegram — no markdown headers, keep it readable on mobile
-- Use rg (ripgrep) for searching files, fd for finding — not grep/find
-- When saheb shares decisions or thoughts, write them to ~/clawd/memory/projects.md
-- When the scheduler triggers you ([SCHEDULER:mode]), reply ${SILENT_TOKEN} if nothing worth saying
-- You can run bash commands on saheb's machine
-- To send a Telegram message: curl -s -X POST ${process.env["TG_API_BASE"] ?? "https://api.telegram.org/botREDACTED"}/sendMessage -d "chat_id=REDACTED_CHAT_ID&text=..."`;
-}
-
-// ── Session factory ────────────────────────────────────────────────────────
-
-export async function getOrCreateSession(
-  meta: ConversationMeta,
-  allConversations: string[],
-): Promise<CachedSession> {
-  const cached = cache.get(meta.name);
-  if (cached) return cached;
-
-  ensureDirs(meta.name);
-  const cwd = meta.cwd ?? PATHS.data;
-
-  const authStorage = AuthStorage.create(join(PATHS.agentDir, "auth.json"));
-  const modelRegistry = new ModelRegistry(authStorage, join(PATHS.agentDir, "models.json"));
-  const settingsManager = SettingsManager.create(cwd, PATHS.agentDir);
-  const sessionManager = SessionManager.open(contextFile(meta.name), conversationDir(meta.name));
-
-  const resourceLoader = new DefaultResourceLoader({ cwd, agentDir: PATHS.agentDir, settingsManager });
-  await resourceLoader.reload();
-
-  const { session } = await createAgentSession({
-    cwd,
-    agentDir: PATHS.agentDir,
-    authStorage,
-    modelRegistry,
-    settingsManager,
-    sessionManager,
-    resourceLoader,
-    tools: codingTools,
-  });
-
-  // Set initial system prompt
-  session.agent.setSystemPrompt(buildSystemPrompt(meta, allConversations));
-
-  const result: CachedSession = { session, sessionManager };
-  cache.set(meta.name, result);
-
-  console.log(`[agent:${meta.name}] Session ready. Messages: ${session.messages.length}`);
-  return result;
-}
-
-// ── evict ──────────────────────────────────────────────────────────────────
-
 export function evictSession(name: string): void {
   cache.delete(name);
 }
 
-// ── Run ────────────────────────────────────────────────────────────────────
+// ── In-process + file mutex ────────────────────────────────────────────────
+// Both runMessage() and runProactive() go through this gate so they never
+// call session.prompt() concurrently on the same AgentSession.
 
-export interface RunResult {
-  readonly text: string;
+const inFlight = new Map<string, Promise<void>>();
+
+async function withLock<T>(identity: SessionIdentity, fn: () => Promise<T>): Promise<T> {
+  while (inFlight.has(identity.name)) {
+    await inFlight.get(identity.name);
+  }
+  let resolve!: () => void;
+  const gate = new Promise<void>(r => { resolve = r; });
+  inFlight.set(identity.name, gate);
+
+  const fileLock = await acquireFileLock(sessionFile(identity.name));
+  try {
+    return await fn();
+  } finally {
+    inFlight.delete(identity.name);
+    resolve();
+    await fileLock.release();
+  }
 }
+
+// ── spawn_agent tool ───────────────────────────────────────────────────────
+
+interface MsgContext { chatId: number; replyToMsgId: number }
+const currentMsgCtx = new Map<string, MsgContext>();
+
+let spawnCounter = 0;
+
+const spawnAgentTool: ToolDefinition = {
+  name: "spawn_agent",
+  label: "Spawn Sub-Agent",
+  description: [
+    "Spawn a focused background agent for a task.",
+    "It replies directly to the user on Telegram as it works — you stay free.",
+    "Use for: coding, file changes, research, multi-step tasks.",
+    "For quick answers or simple questions, just respond yourself.",
+  ].join(" "),
+  parameters: Type.Object({
+    task:    Type.String({ description: "Clear task description" }),
+    cwd:     Type.Optional(Type.String({ description: "Working directory (e.g. ~/Code/Zereraz/eidos)" })),
+    context: Type.Optional(Type.String({ description: "Extra context to pass (file paths, notes)" })),
+  }),
+  execute: async (_id, params: Static<typeof spawnAgentTool.parameters>) => {
+    const ctx = currentMsgCtx.get(MAIN_CONVERSATION);
+    if (!ctx) return { content: [{ type: "text" as const, text: "Error: no message context" }], details: {} };
+
+    spawnCounter++;
+    const agentId = `agent-${spawnCounter}`;
+    await spawnSubAgent({
+      id: agentId,
+      task: params.task,
+      chatId: ctx.chatId,
+      replyToMsgId: ctx.replyToMsgId,
+      cwd: params.cwd,
+      context: params.context,
+    });
+
+    return {
+      content: [{ type: "text" as const, text: `Sub-agent "${agentId}" spawned — will reply directly to you.` }],
+      details: {},
+    };
+  },
+};
+
+// ── System prompt ──────────────────────────────────────────────────────────
+
+function buildSystemPrompt(identity: SessionIdentity): string {
+  const running = activeSubAgents();
+  return `You are pi — saheb's always-on AI companion on Telegram.${identity.cwd ? `\nWorking directory: ${identity.cwd}` : ""}
+
+## User
+${readUser() || "Name: Sahebjot (saheb). Timezone: Asia/Calcutta."}
+
+## Today
+${readTodayLog()}
+
+## Projects
+${readProjects()}
+
+## Memory
+${readMemory()}
+
+## Igne notes
+${readIgneIndex()}
+
+## Active sub-agents
+${running.length > 0 ? running.map(a => `• ${a.id}: ${a.task.slice(0, 60)}`).join("\n") : "none"}
+
+## Behavior
+- Concise on Telegram — no markdown headers, readable on mobile
+- Use rg for searching, fd for finding (not grep/find)
+- For code, files, multi-step tasks: use spawn_agent — it runs in parallel and keeps you free
+- For quick answers, lookups, memory updates: respond yourself
+- When saheb shares thoughts about a project: save them to ~/pi-tg/memory/projects.md
+- Scheduler prompts ([SCHEDULER:mode]): reply ${SILENT_TOKEN} if nothing worth saying`;
+}
+
+// ── Session factory ────────────────────────────────────────────────────────
+
+export async function getOrCreateSession(identity: SessionIdentity): Promise<CachedSession> {
+  const cached = cache.get(identity.name);
+  if (cached) return cached;
+
+  initStore();
+  const cwd = identity.cwd ?? PATHS.data;
+
+  const authStorage   = AuthStorage.create(join(PATHS.agentDir, "auth.json"));
+  const modelRegistry = new ModelRegistry(authStorage, join(PATHS.agentDir, "models.json"));
+  const settingsManager = SettingsManager.create(cwd, PATHS.agentDir);
+
+  // Fixed file per identity — grows forever, pi auto-compacts inline.
+  // sessionDir = PI_SESSIONS_DIR so TUI /new, /fork, /resume land in the right place.
+  const sm = SessionManager.open(sessionFile(identity.name), PI_SESSIONS_DIR);
+
+  const loader = new DefaultResourceLoader({ cwd, agentDir: PATHS.agentDir, settingsManager });
+  await loader.reload();
+
+  const tools = identity.name === MAIN_CONVERSATION
+    ? [...codingTools, spawnAgentTool]
+    : codingTools;
+
+  const { session } = await createAgentSession({
+    cwd, agentDir: PATHS.agentDir,
+    authStorage, modelRegistry, settingsManager,
+    sessionManager: sm, resourceLoader: loader, tools,
+  });
+
+  session.agent.setSystemPrompt(buildSystemPrompt(identity));
+
+  // Name the session so it shows correctly in `pi -r`
+  const displayName = `Telegram — ${identity.name}`;
+  if (sm.getSessionName() !== displayName) sm.appendSessionInfo(displayName);
+
+  const result: CachedSession = { session, sessionManager: sm };
+  cache.set(identity.name, result);
+  console.log(`[agent:${identity.name}] Session ready. Messages: ${session.messages.length}`);
+  return result;
+}
+
+// ── Main conversation helpers ──────────────────────────────────────────────
 
 export async function runMessage(
-  meta: ConversationMeta,
-  allConversations: string[],
   userMessage: string,
   messageTs: number,
+  msgCtx?: MsgContext,
+  onDelta?: (accumulated: string) => void,
+  onToolCall?: (name: string, args: unknown) => void,
+  onToolResult?: (name: string, args: unknown, result: unknown) => void,
 ): Promise<RunResult> {
-  const { session, sessionManager } = await getOrCreateSession(meta, allConversations);
+  return withLock(MAIN, async () => {
+    const { session, sessionManager } = await getOrCreateSession(MAIN);
 
-  // Sync any messages logged while we were offline
-  const synced = syncLogToContext(sessionManager, meta.name, messageTs);
-  if (synced > 0) {
-    const ctx = sessionManager.buildSessionContext();
-    session.agent.replaceMessages(ctx.messages);
-    console.log(`[agent:${meta.name}] Synced ${synced} messages from log`);
-  }
+    if (msgCtx) currentMsgCtx.set(MAIN_CONVERSATION, msgCtx);
 
-  // Refresh system prompt with latest memory
-  session.agent.setSystemPrompt(buildSystemPrompt(meta, allConversations));
-
-  let text = "";
-  const unsub = session.subscribe(event => {
-    if (event.type === "message_update") {
-      const e = event as unknown as { assistantMessageEvent?: { type: string; delta?: string } };
-      if (e.assistantMessageEvent?.type === "text_delta") {
-        text += e.assistantMessageEvent.delta ?? "";
-      }
+    const synced = syncLogToContext(sessionManager, messageTs);
+    if (synced > 0) {
+      session.agent.replaceMessages(sessionManager.buildSessionContext().messages);
+      console.log(`[agent:main] Synced ${synced} messages from log`);
     }
+
+    session.agent.setSystemPrompt(buildSystemPrompt(MAIN));
+
+    let text = "";
+    const unsub = session.subscribe(event => {
+      if (event.type === "message_update") {
+        const e = event as unknown as { assistantMessageEvent?: { type: string; delta?: string } };
+        if (e.assistantMessageEvent?.type === "text_delta") {
+          text += e.assistantMessageEvent.delta ?? "";
+          onDelta?.(text);
+        }
+      }
+      if (event.type === "tool_execution_start") {
+        const e = event as unknown as { toolName: string; args: unknown };
+        onToolCall?.(e.toolName, e.args);
+      }
+      if (event.type === "tool_execution_end") {
+        const e = event as unknown as { toolName: string; args: unknown; result: unknown };
+        onToolResult?.(e.toolName, e.args, e.result);
+      }
+    });
+
+    try {
+      await session.prompt(userMessage);
+    } finally {
+      unsub();
+    }
+
+    return { text: text.trim() };
   });
-
-  try {
-    await session.prompt(userMessage);
-  } finally {
-    unsub();
-  }
-
-  return { text: text.trim() };
 }
 
-/** Run a proactive scheduler prompt. Sends Telegram only if non-silent. */
-export async function runProactive(
-  meta: ConversationMeta,
-  allConversations: string[],
-  prompt: string,
-): Promise<void> {
-  const { session } = await getOrCreateSession(meta, allConversations);
-  session.agent.setSystemPrompt(buildSystemPrompt(meta, allConversations));
+export async function runProactive(prompt: string): Promise<void> {
+  await withLock(MAIN, async () => {
+    const { session } = await getOrCreateSession(MAIN);
+    session.agent.setSystemPrompt(buildSystemPrompt(MAIN));
 
-  let text = "";
-  const unsub = session.subscribe(event => {
-    if (event.type === "message_update") {
-      const e = event as unknown as { assistantMessageEvent?: { type: string; delta?: string } };
-      if (e.assistantMessageEvent?.type === "text_delta") {
-        text += e.assistantMessageEvent.delta ?? "";
+    let text = "";
+    const unsub = session.subscribe(event => {
+      if (event.type === "message_update") {
+        const e = event as unknown as { assistantMessageEvent?: { type: string; delta?: string } };
+        if (e.assistantMessageEvent?.type === "text_delta") text += e.assistantMessageEvent.delta ?? "";
       }
+    });
+    try {
+      await session.prompt(`[SCHEDULER] ${prompt}`);
+    } finally {
+      unsub();
     }
+
+    const trimmed = text.trim();
+    if (!trimmed || trimmed.includes(SILENT_TOKEN)) {
+      console.log("[agent:main] Scheduler: silent");
+      return;
+    }
+    console.log(`[agent:main] Scheduler sending: ${trimmed.slice(0, 60)}…`);
+    await notifyOwner(trimmed);
   });
-
-  try {
-    await session.prompt(`[SCHEDULER] ${prompt}`);
-  } finally {
-    unsub();
-  }
-
-  const trimmed = text.trim();
-  if (!trimmed || trimmed.includes(SILENT_TOKEN)) {
-    console.log(`[agent:${meta.name}] Scheduler: silent`);
-    return;
-  }
-
-  console.log(`[agent:${meta.name}] Scheduler sending: ${trimmed.slice(0, 60)}…`);
-  await notifyOwner(trimmed);
 }
 
-// ── Helpers re-exported ────────────────────────────────────────────────────
+// ── Tool formatting (used by bot.ts for streaming status) ─────────────────
 
-function conversationDir(name: string): string {
-  return join(PATHS.data, "conversations", name);
+export function formatToolCall(toolName: string, args: unknown): string {
+  const a = args as Record<string, unknown>;
+  const p = (s: string) => s.replace(process.env["HOME"] ?? "", "~");
+  switch (toolName) {
+    case "bash":  return `⚙️ bash: ${String(a["command"] ?? "").replace(/\n/g, " ").slice(0, 60)}`;
+    case "read":  return `📖 read: ${p(String(a["path"] ?? ""))}`;
+    case "edit":  return `✏️ edit: ${p(String(a["path"] ?? ""))}`;
+    case "write": return `📝 write: ${p(String(a["path"] ?? ""))}`;
+    case "spawn_agent": return `🤖 spawn: ${String(a["task"] ?? "").slice(0, 50)}`;
+    default:      return `🔧 ${toolName}`;
+  }
+}
+
+export function formatToolResult(toolName: string, args: unknown, result: unknown): string {
+  const a = args as Record<string, unknown>;
+  const p = (s: string) => s.replace(process.env["HOME"] ?? "", "~");
+  const r = result as { content?: Array<{ type: string; text?: string }> } | null;
+  const lines = r?.content?.filter(c => c.type === "text").map(c => c.text ?? "").join("").split("\n").length ?? 0;
+  const n = lines > 1 ? ` (${lines} lines)` : "";
+  switch (toolName) {
+    case "bash":  return `✓ bash: ${String(a["command"] ?? "").replace(/\n/g, " ").slice(0, 50)}${n}`;
+    case "read":  return `✓ read: ${p(String(a["path"] ?? ""))}${n}`;
+    case "edit":  return `✓ edit: ${p(String(a["path"] ?? ""))}`;
+    case "write": return `✓ write: ${p(String(a["path"] ?? ""))}`;
+    default:      return `✓ ${toolName}`;
+  }
 }
