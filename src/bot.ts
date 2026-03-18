@@ -147,6 +147,7 @@ export function createBot(transport: Transport) {
 
       await ctx.setStatus("done");
 
+      // Log FIRST — so even if the final edit/send fails, response is persisted
       const now = Date.now();
       await appendLog({ date: new Date(now).toISOString(), ts: now, role: "bot", text: response });
       console.log(`[bot] Replied (${response.length} chars)`);

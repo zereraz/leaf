@@ -48,15 +48,16 @@ void warmupSession();
 notifyOwner("👋 pi-tg online").catch(() => {});
 
 // ── Graceful shutdown ───────────────────────────────────────────────────────
-function shutdown(signal: string): void {
+async function shutdown(signal: string): Promise<void> {
   console.log(`[pi-tg] ${signal}. Shutting down.`);
+  await notifyOwner(`🔴 going down (${signal})`).catch(() => {});
   stopScheduler();
   bot.stop();
   process.exit(0);
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 process.on("uncaughtException", async (err: Error) => {
   console.error("[pi-tg] Uncaught exception:", err);
