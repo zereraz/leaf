@@ -31,7 +31,7 @@ import {
 import { PATHS } from "./config.js";
 import { PI_SESSIONS_DIR } from "./store.js";
 
-const PROJECT_DIR = join(PATHS.home, "Code/Zereraz/pi-tg");
+const PROJECT_DIR = join(PATHS.leafHome);
 const REVIEW_SESSION_FILE = join(PI_SESSIONS_DIR, "review.jsonl");
 
 // ── submit_review tool — the ONLY way the review agent completes ───────────
@@ -105,7 +105,7 @@ async function getReviewSession() {
   });
 
   session.agent.setSystemPrompt(
-    `You are the review agent for pi-tg — a safety gate before any restart.\n\n` +
+    `You are the review agent for leaf — a safety gate before any restart.\n\n` +
     `## Your job\n` +
     `Run ALL four checks using bash tools, then call submit_review() with your structured verdict.\n` +
     `You MUST call submit_review() — never write a verdict in plain text.\n\n` +

@@ -21,6 +21,7 @@ export interface IncomingMessage {
   readonly text: string;
   readonly fromId: number;   // sender platform ID
   readonly timestamp: number; // unix ms
+  readonly replyToText?: string | undefined;  // text of the message being replied to (if any)
 }
 
 // ── Response context (per message) ───────────────────────────────────────

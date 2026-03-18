@@ -6,7 +6,7 @@
  *     state.json               — Telegram offset + scheduler state
  *     log.jsonl                — all messages (user + bot), append-only
  *
- *   ~/.pi/agent/sessions/pi-tg/
+ *   ~/.pi/agent/sessions/leaf/
  *     main.jsonl               — pi SDK session (standard format, visible in `pi -r`)
  *     subagent-<id>.jsonl      — sub-agent sessions
  */
@@ -22,6 +22,7 @@ export interface LogEntry {
   readonly ts: number;          // unix ms
   readonly role: "user" | "bot";
   readonly text: string;
+  readonly sentText?: string;   // what telegram actually received (bot only — for debugging delivery)
   readonly updateId?: number;   // Telegram update_id — for dedup
   readonly messageId?: number;  // Telegram message_id — for reply_parameters
 }
@@ -37,7 +38,7 @@ const STATE_FILE = join(PATHS.data, "state.json");
 const LOG_FILE   = join(PATHS.data, "log.jsonl");
 
 /** Standard pi sessions dir — all sessions visible in `pi -r` */
-export const PI_SESSIONS_DIR = join(PATHS.agentDir, "sessions", "pi-tg");
+export const PI_SESSIONS_DIR = join(PATHS.agentDir, "sessions", "leaf");
 
 /** pi SDK session file for a named session (main or sub-agent) */
 export function sessionFile(name: string): string {

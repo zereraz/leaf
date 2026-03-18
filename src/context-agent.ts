@@ -54,65 +54,72 @@ export function readContextBrief(): string {
 // ── Signal gathering (fast bash, no LLM) ──────────────────────────────────
 
 function recentCommits(): string {
-  const codeDirs = PATHS.codeDirs;
-  const lines: string[] = [];
-  for (const base of codeDirs) {
-    if (!existsSync(base)) continue;
-    try {
-      const gitDirs = execSync(
-        `fd -t d -d 3 --hidden "^\\.git$" "${base}"`,
-        { encoding: "utf-8", timeout: 8000 }
-      ).trim().split("\n").filter(Boolean);
+  // Discover code dirs dynamically from ~/Code
+  const codeBase = join(PATHS.home, "Code");
+  if (!existsSync(codeBase)) return "(no ~/Code directory)";
 
-      for (const gd of gitDirs) {
-        const repo = gd.replace(/\/\.git$/, "");
-        try {
-          const log = execSync(
-            `git -C "${repo}" log --oneline --since="48 hours ago" --format="%ar | %s" 2>/dev/null`,
-            { encoding: "utf-8", timeout: 4000 }
-          ).trim();
-          if (!log) continue;
-          const name = repo.split("/").pop() ?? repo;
-          lines.push(`${name}:\n${log.split("\n").slice(0, 6).map(l => `  ${l}`).join("\n")}`);
-        } catch { /* skip */ }
-      }
-    } catch { /* skip */ }
-  }
+  const lines: string[] = [];
+  try {
+    const gitDirs = execSync(
+      `fd -t d -d 4 --hidden "^\\.git$" "${codeBase}"`,
+      { encoding: "utf-8", timeout: 8000 }
+    ).trim().split("\n").filter(Boolean);
+
+    for (const gd of gitDirs) {
+      const repo = gd.replace(/\/\.git$/, "");
+      try {
+        const log = execSync(
+          `git -C "${repo}" log --oneline --since="48 hours ago" --format="%ar | %s" 2>/dev/null`,
+          { encoding: "utf-8", timeout: 4000 }
+        ).trim();
+        if (!log) continue;
+        const name = repo.split("/").pop() ?? repo;
+        lines.push(`${name}:\n${log.split("\n").slice(0, 6).map(l => `  ${l}`).join("\n")}`);
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
   return lines.join("\n\n") || "(no recent commits)";
 }
 
 function recentSessionTopics(): string {
   const results: string[] = [];
 
-  // Most recent pi session (this conversation with saheb)
-  const piSessionDir = join(PATHS.agentDir, "sessions", "--Users-zereraz--");
-  if (existsSync(piSessionDir)) {
+  // Most recent pi session — find dynamically
+  const piSessionBase = join(PATHS.agentDir, "sessions");
+  if (existsSync(piSessionBase)) {
     try {
-      const files = execSync(`ls -t "${piSessionDir}"`, { encoding: "utf-8" })
-        .trim().split("\n").filter(f => f.endsWith(".jsonl")).slice(0, 1);
-      for (const f of files) {
-        const path = join(piSessionDir, f);
-        const lines = readFileSync(path, "utf-8").split("\n").filter(Boolean);
-        const userMsgs: string[] = [];
-        for (const line of lines.slice(-60)) { // last 60 entries
-          try {
-            const e = JSON.parse(line);
-            if (e?.type === "message" && e?.message?.role === "user") {
-              const content = e.message.content;
-              const text = typeof content === "string"
-                ? content
-                : Array.isArray(content)
-                  ? content.find((c: { type: string }) => c.type === "text")?.text ?? ""
-                  : "";
-              if (text && !text.startsWith("[SCHEDULER]")) {
-                userMsgs.push(text.slice(0, 80));
-              }
+      const sessionDirs = execSync(`ls -t "${piSessionBase}"`, { encoding: "utf-8" })
+        .trim().split("\n").filter(Boolean).slice(0, 3);
+      for (const sd of sessionDirs) {
+        const piSessionDir = join(piSessionBase, sd);
+        try {
+          const files = execSync(`ls -t "${piSessionDir}"`, { encoding: "utf-8" })
+            .trim().split("\n").filter(f => f.endsWith(".jsonl")).slice(0, 1);
+          for (const f of files) {
+            const path = join(piSessionDir, f);
+            const lines = readFileSync(path, "utf-8").split("\n").filter(Boolean);
+            const userMsgs: string[] = [];
+            for (const line of lines.slice(-60)) {
+              try {
+                const e = JSON.parse(line);
+                if (e?.type === "message" && e?.message?.role === "user") {
+                  const content = e.message.content;
+                  const text = typeof content === "string"
+                    ? content
+                    : Array.isArray(content)
+                      ? content.find((c: { type: string }) => c.type === "text")?.text ?? ""
+                      : "";
+                  if (text && !text.startsWith("[SCHEDULER]")) {
+                    userMsgs.push(text.slice(0, 80));
+                  }
+                }
+              } catch { /* skip */ }
             }
-          } catch { /* skip */ }
-        }
-        if (userMsgs.length > 0) {
-          results.push(`Recent pi session topics:\n${userMsgs.slice(-5).map(m => `  - ${m}`).join("\n")}`);
-        }
+            if (userMsgs.length > 0) {
+              results.push(`Recent pi session topics:\n${userMsgs.slice(-5).map(m => `  - ${m}`).join("\n")}`);
+            }
+          }
+        } catch { /* skip */ }
       }
     } catch { /* skip */ }
   }

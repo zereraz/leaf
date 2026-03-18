@@ -7,7 +7,7 @@ import { readState, updateState } from "./store.js";
 import { runProactive } from "./agent.js";
 import { gatherContext, readContextBrief } from "./context-agent.js";
 import {
-  readProjects, readIgneIndex, readIgneFile, readTodayLog,
+  readProjects, readTodayLog,
   recentGitActivity, hottestRepo, allRepoActivity, gitLog, gitDiffStat,
 } from "./memory.js";
 
@@ -58,9 +58,6 @@ function pickMode(): SchedulerMode | null {
   if (hour >= 20 && hour < 22 && lastKey("evening_wrap") !== today && cooldownOk("evening_wrap"))
     return "evening_wrap";
 
-  if (hour >= 12 && hour < 18 && lastKey("igne_surface") !== today && cooldownOk("igne_surface"))
-    return "igne_surface";
-
   const dayName = new Date().toLocaleDateString("en-US", { weekday: "long", timeZone: SCHEDULER.tz });
   if (dayName === "Sunday" && lastKey("stale_review") !== week && cooldownOk("stale_review"))
     return "stale_review";
@@ -93,23 +90,6 @@ Pick the ONE thing with most momentum right now. Say what it is, why it matters 
 ${context}
 
 Surface the most interesting thing happening right now — the actual direction, an open question, or what the next decision probably is. 2-3 lines. ${SILENT_TOKEN} if nothing specific stands out.`;
-
-    case "igne_surface": {
-      const ideas = readIgneFile("ideas.md");
-      const igneIndex = readIgneIndex();
-      return `[SCHEDULER:igne_surface] Surface one igne note that connects to what saheb is doing.
-
-## Current focus
-${context}
-
-## Igne notes index
-${igneIndex}
-
-## Ideas note
-${ideas}
-
-Pick ONE igne note that genuinely connects to his current work. Quote the key line. Explain the connection in 1-2 sentences. ${SILENT_TOKEN} if nothing genuine.`;
-    }
 
     case "evening_wrap":
       return `[SCHEDULER:evening_wrap] Evening check-in.

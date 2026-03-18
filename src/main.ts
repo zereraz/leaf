@@ -20,16 +20,16 @@ const forceModeArg = args.find(a => a.startsWith("--force="))?.slice("--force=".
 
 // ── Init ────────────────────────────────────────────────────────────────────
 initStore();
-console.log("[pi-tg] Starting…");
+console.log("[leaf] Starting…");
 
 // ── Force mode (manual trigger + exit) ─────────────────────────────────────
 if (forceModeArg) {
-  const valid: SchedulerMode[] = ["morning_brief", "pulse", "igne_surface", "evening_wrap", "stale_review"];
+  const valid: SchedulerMode[] = ["morning_brief", "pulse", "evening_wrap", "stale_review"];
   if (!valid.includes(forceModeArg as SchedulerMode)) {
     console.error(`Unknown mode: ${forceModeArg}. Valid: ${valid.join(", ")}`);
     process.exit(1);
   }
-  console.log(`[pi-tg] Force mode: ${forceModeArg}`);
+  console.log(`[leaf] Force mode: ${forceModeArg}`);
   await forceMode(forceModeArg as SchedulerMode);
   process.exit(0);
 }
@@ -45,11 +45,11 @@ void bot.start();
 
 // Warm session — first message pays no init cost
 void warmupSession();
-notifyOwner("👋 pi-tg online").catch(() => {});
+notifyOwner("👋 leaf online").catch(() => {});
 
 // ── Graceful shutdown ───────────────────────────────────────────────────────
 async function shutdown(signal: string): Promise<void> {
-  console.log(`[pi-tg] ${signal}. Shutting down.`);
+  console.log(`[leaf] ${signal}. Shutting down.`);
   await notifyOwner(`🔴 going down (${signal})`).catch(() => {});
   stopScheduler();
   bot.stop();
@@ -60,11 +60,11 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 process.on("uncaughtException", async (err: Error) => {
-  console.error("[pi-tg] Uncaught exception:", err);
-  await notifyOwner(`⚠️ pi-tg crashed: ${err.message}`).catch(() => {});
+  console.error("[leaf] Uncaught exception:", err);
+  await notifyOwner(`⚠️ leaf crashed: ${err.message}`).catch(() => {});
   process.exit(1);
 });
 
 process.on("unhandledRejection", (reason: unknown) => {
-  console.error("[pi-tg] Unhandled rejection:", reason);
+  console.error("[leaf] Unhandled rejection:", reason);
 });

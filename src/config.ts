@@ -7,11 +7,11 @@ import { join } from "node:path";
 
 const HOME = homedir();
 
-const PI_TG_HOME = join(HOME, "pi-tg");
+const LEAF_HOME = join(HOME, "leaf");
 
 export const TG = {
-  botToken: process.env["TG_BOT_TOKEN"] ?? "REDACTED",
-  ownerChatId: Number(process.env["TG_CHAT_ID"] ?? REDACTED_CHAT_ID),
+  botToken: process.env["TG_BOT_TOKEN"] ?? "",
+  ownerChatId: Number(process.env["TG_CHAT_ID"] ?? ""),
   get apiBase() { return `https://api.telegram.org/bot${this.botToken}`; },
   pollTimeoutSecs: 30,
   maxMessageLen: 4000,
@@ -19,15 +19,13 @@ export const TG = {
 
 export const PATHS = {
   home: HOME,
-  piTgHome: PI_TG_HOME,
-  data: join(PI_TG_HOME, "data"),
+  leafHome: LEAF_HOME,
+  data: join(LEAF_HOME, "data"),
   agentDir: join(HOME, ".pi", "agent"),       // auth/models — shared with pi coding agent
-  projects: join(PI_TG_HOME, "memory", "projects.md"),
-  memory: join(PI_TG_HOME, "MEMORY.md"),
-  user: join(PI_TG_HOME, "USER.md"),
-  dailyLogs: join(PI_TG_HOME, "memory"),
-  igne: join(HOME, "Library/Mobile Documents/com~apple~CloudDocs/igne/cloud-v1"),
-  codeDirs: [join(HOME, "Code/Zereraz"), join(HOME, "Code/Juspay")],
+  projects: join(LEAF_HOME, "memory", "projects.md"),
+  memory: join(LEAF_HOME, "MEMORY.md"),
+  user: join(LEAF_HOME, "USER.md"),
+  dailyLogs: join(LEAF_HOME, "memory"),
 } as const;
 
 export const SCHEDULER = {
@@ -38,7 +36,6 @@ export const SCHEDULER = {
   cooldowns: {
     morning_brief: 20 * 3600,
     pulse: 2 * 3600,
-    igne_surface: 22 * 3600,
     evening_wrap: 20 * 3600,
     stale_review: 6 * 24 * 3600,
   } as Record<SchedulerMode, number>,
@@ -50,6 +47,5 @@ export const MAIN_CONVERSATION = "main";
 export type SchedulerMode =
   | "morning_brief"
   | "pulse"
-  | "igne_surface"
   | "evening_wrap"
   | "stale_review";

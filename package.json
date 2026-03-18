@@ -1,5 +1,5 @@
 {
-  "name": "pi-tg",
+  "name": "leaf",
   "version": "0.1.0",
   "description": "Always-on Telegram bot backed by pi — persistent history, multi-agent routing, proactive scheduler",
   "type": "module",

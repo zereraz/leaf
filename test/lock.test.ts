@@ -10,7 +10,7 @@ import { acquireFileLock } from "../src/lock.js";
 let dir: string;
 
 beforeEach(() => {
-  dir = join(tmpdir(), `pi-tg-lock-test-${Date.now()}`);
+  dir = join(tmpdir(), `leaf-lock-test-${Date.now()}`);
   mkdirSync(dir, { recursive: true });
 });
 

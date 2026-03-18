@@ -27,24 +27,6 @@ export function readTodayLog(): string {
   return readFileSafe(join(PATHS.dailyLogs, `${today}.md`), "(no log today)");
 }
 
-export function readIgneIndex(): string {
-  if (!existsSync(PATHS.igne)) return "(igne not found)";
-  try {
-    return readdirSync(PATHS.igne)
-      .filter(f => f.endsWith(".md"))
-      .map(f => {
-        const first = readFileSafe(join(PATHS.igne, f))
-          .split("\n").slice(0, 2).join(" ").slice(0, 80);
-        return `- ${f}: ${first}`;
-      })
-      .join("\n");
-  } catch { return "(error reading igne)"; }
-}
-
-export function readIgneFile(filename: string): string {
-  return readFileSafe(join(PATHS.igne, filename));
-}
-
 // ── Git activity (fd + git) ────────────────────────────────────────────────
 
 export interface RepoActivity {
@@ -52,6 +34,17 @@ export interface RepoActivity {
   readonly path: string;
   readonly commitCount: number;
   readonly lastCommit: string;
+}
+
+/** Discover code dirs dynamically from ~/Code */
+function getCodeDirs(): string[] {
+  const codeBase = join(PATHS.home, "Code");
+  if (!existsSync(codeBase)) return [];
+  try {
+    return readdirSync(codeBase, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => join(codeBase, d.name));
+  } catch { return []; }
 }
 
 function findGitDirs(bases: readonly string[], maxDepth = 3): string[] {
@@ -89,7 +82,7 @@ function gitLastCommit(repoPath: string): string {
 }
 
 export function recentGitActivity(days = 7): RepoActivity[] {
-  return findGitDirs(PATHS.codeDirs)
+  return findGitDirs(getCodeDirs())
     .map(path => {
       const count = gitCount(path, `${days} days ago`);
       if (count === 0) return null;
@@ -105,21 +98,21 @@ export function recentGitActivity(days = 7): RepoActivity[] {
 }
 
 export function hottestRepo(hours = 48): RepoActivity | null {
-  const repos = findGitDirs(PATHS.codeDirs).map(path => {
+  const repos = findGitDirs(getCodeDirs()).map(path => {
     const count = gitCount(path, `${hours} hours ago`);
     return { name: path.split("/").pop() ?? path, path, commitCount: count, lastCommit: gitLastCommit(path) };
   }).filter(r => r.commitCount > 0).sort((a, b) => b.commitCount - a.commitCount);
 
   if (repos.length > 0) return repos[0] ?? null;
   // Fallback: 7-day window
-  return findGitDirs(PATHS.codeDirs)
+  return findGitDirs(getCodeDirs())
     .map(path => ({ name: path.split("/").pop() ?? path, path, commitCount: gitCount(path, "7 days ago"), lastCommit: gitLastCommit(path) }))
     .filter(r => r.commitCount > 0)
     .sort((a, b) => b.commitCount - a.commitCount)[0] ?? null;
 }
 
 export function allRepoActivity(): string {
-  return findGitDirs(PATHS.codeDirs)
+  return findGitDirs(getCodeDirs())
     .map(path => {
       const last = gitLastCommit(path);
       return last ? `${path.split("/").pop()}: ${last}` : null;

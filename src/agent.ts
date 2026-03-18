@@ -25,7 +25,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { PATHS, MAIN_CONVERSATION, SILENT_TOKEN } from "./config.js";
 import { sessionFile, PI_SESSIONS_DIR, initStore } from "./store.js";
 import { syncLogToContext } from "./context.js";
-import { readProjects, readMemory, readUser, readIgneIndex, readTodayLog } from "./memory.js";
+import { readProjects, readMemory, readUser, readTodayLog } from "./memory.js";
 import { notifyOwner } from "./telegram.js";
 import { acquireFileLock } from "./lock.js";
 import { spawnSubAgent, activeSubAgents } from "./subagent.js";
@@ -114,7 +114,7 @@ const spawnAgentTool: ToolDefinition = {
   ].join(" "),
   parameters: Type.Object({
     task:    Type.String({ description: "Clear task description" }),
-    cwd:     Type.Optional(Type.String({ description: "Working directory (e.g. ~/Code/Zereraz/eidos)" })),
+    cwd:     Type.Optional(Type.String({ description: "Working directory (e.g. ~/Code/myproject)" })),
     context: Type.Optional(Type.String({ description: "Extra context to pass (file paths, notes)" })),
   }),
   execute: async (_id, params) => {
@@ -163,7 +163,7 @@ const restartBotTool: ToolDefinition = {
       setTimeout(() => {
         try {
           execSync(
-            `launchctl unload ~/Library/LaunchAgents/ai.pi.tg.plist && sleep 1 && launchctl load ~/Library/LaunchAgents/ai.pi.tg.plist`,
+            `launchctl unload ~/Library/LaunchAgents/ai.leaf.plist && sleep 1 && launchctl load ~/Library/LaunchAgents/ai.leaf.plist`,
             { shell: "/bin/bash", timeout: 15_000, env: { ...process.env, HOME: PATHS.home } },
           );
         } catch { /* process exits on restart — expected */ }
@@ -228,9 +228,9 @@ ${running.length > 0 ? running.map(a => `• ${a.id}: ${a.task.slice(0, 60)}`).j
 - **Engage, don't just answer** — if you notice something relevant to what saheb is working on, say it. Connect dots. Ask questions that show you understand the work.
 - When saheb sends a message after a long gap, acknowledge the gap naturally
 - Scheduler prompts ([SCHEDULER:mode]): use the context brief above to say something SPECIFIC, not generic. Reply ${SILENT_TOKEN} if nothing genuine to say.
-- When saheb shares decisions or thoughts: save them to ~/pi-tg/memory/projects.md
+- When saheb shares decisions or thoughts: save them to ~/leaf/memory/projects.md
 - For code, files, multi-step tasks: use spawn_agent — it runs in parallel and keeps you free
-- **After making any code change to pi-tg: ALWAYS call restart_bot — never use launchctl directly**
+- **After making any code change to leaf: ALWAYS call restart_bot — never use launchctl directly**
   - restart_bot runs tsc + tests + LLM diff review before restarting
   - If review fails it reports what's wrong without restarting
   - This is the safety gate — never bypass it

@@ -11,6 +11,8 @@
 import { MAIN_CONVERSATION } from "./config.js";
 import { evictSession } from "./agent.js";
 import { activeSubAgents } from "./subagent.js";
+import { readLog } from "./store.js";
+import { getDebugSnapshot, formatDebugSnapshot } from "./debug-client-agent.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -36,6 +38,7 @@ function handleCommand(text: string): RouteResult {
     case "/status": return cmdStatus();
     case "/reset":  return cmdReset();
     case "/agents": return cmdAgents();
+    case "/debug":  return cmdDebug(args);
     default:
       return { kind: "command_reply", text: `Unknown: ${cmd}\n\n${helpText()}` };
   }
@@ -45,7 +48,7 @@ function cmdStatus(): RouteResult {
   const uptime = formatUptime(process.uptime());
   const agents = activeSubAgents();
   const lines = [
-    `🤖 pi-tg`,
+    `🤖 leaf`,
     `Uptime: ${uptime}`,
     agents.length > 0 ? `Sub-agents: ${agents.length} active` : null,
   ].filter((l): l is string => l !== null);
@@ -67,6 +70,12 @@ function cmdAgents(): RouteResult {
   return { kind: "command_reply", text: `Active sub-agents:\n\n${lines.join("\n")}` };
 }
 
+function cmdDebug(args: string): RouteResult {
+  const n = Math.min(parseInt(args, 10) || 3, 10);
+  const snap = getDebugSnapshot(n);
+  return { kind: "command_reply", text: formatDebugSnapshot(snap) };
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function formatUptime(seconds: number): string {
@@ -83,6 +92,7 @@ function helpText(): string {
     "/status  — uptime & info",
     "/reset   — clear session context",
     "/agents  — list active sub-agents",
+    "/debug [n] — show last n bot messages from log (default 1, max 5)",
     "/help    — this",
   ].join("\n");
 }

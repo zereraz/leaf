@@ -18,6 +18,7 @@ export interface TgMessage {
   readonly chat: TgChat;
   readonly date: number; // unix seconds
   readonly text?: string;
+  readonly reply_to_message?: TgMessage;
 }
 
 export interface TgUser {
@@ -251,6 +252,7 @@ import type {
   Transport, TransportConfig, MessageContext,
   IncomingMessage as TransportMessage, SentMessage, SendOptions,
 } from "./transport.js";
+import { formatForTelegram } from "./markdown.js";
 
 const STATUS_EMOJI: Record<"working" | "done" | "error", string> = {
   working: "⌛",
@@ -268,11 +270,13 @@ class TelegramMessageContext implements MessageContext {
   }
 
   async send(text: string, opts?: SendOptions): Promise<SentMessage> {
+    const fmt = formatForTelegram(text);
     const tgOpts: SendMessageOptions = {
+      ...(fmt.parseMode ? { parse_mode: fmt.parseMode } : {}),
       ...(opts?.replyToId ? { reply_parameters: { message_id: opts.replyToId } } : {}),
       ...(opts?.copyable ? { reply_markup: copyButton(opts.copyText ?? text) } : {}),
     };
-    const sent = await sendMessage(this.chatId, text, tgOpts);
+    const sent = await sendMessage(this.chatId, fmt.text, tgOpts);
     return { id: sent.message_id, chatId: this.chatId };
   }
 
@@ -282,11 +286,16 @@ class TelegramMessageContext implements MessageContext {
   }
 
   async update(msgId: number, text: string): Promise<void> {
-    await editMessage(this.chatId, msgId, text);
+    const fmt = formatForTelegram(text);
+    await editMessage(this.chatId, msgId, fmt.text, {
+      ...(fmt.parseMode ? { parse_mode: fmt.parseMode } : {}),
+    });
   }
 
   async finish(msgId: number, text: string, opts?: SendOptions): Promise<void> {
-    await editMessage(this.chatId, msgId, text, {
+    const fmt = formatForTelegram(text);
+    await editMessage(this.chatId, msgId, fmt.text, {
+      ...(fmt.parseMode ? { parse_mode: fmt.parseMode } : {}),
       ...(opts?.copyable ? { reply_markup: copyButton(opts.copyText ?? text) } : {}),
     });
   }
@@ -361,6 +370,7 @@ export class TelegramTransport implements Transport {
             text: msg.text.trim(),
             fromId: msg.from?.id ?? 0,
             timestamp: msg.date * 1000,
+            replyToText: msg.reply_to_message?.text?.trim(),
           });
         }
       } catch (err) {
