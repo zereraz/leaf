@@ -1,20 +1,24 @@
 /**
- * review-agent.ts — safety gate before any code change triggers a restart.
+ * review-agent.ts — the safety gate for all code changes.
  *
- * Must pass before launchctl reload is allowed. Runs three checks:
+ * Architecture:
+ *   Main agent calls restart_bot tool
+ *     → review agent (its own persistent session) receives the request
+ *     → runs tsc, tests, scope check, diff review using bash tools
+ *     → reports findings back to main agent as the tool result
+ *     → main agent must fix all issues and call restart_bot again
+ *     → loop continues until review agent approves
+ *     → only then does restart happen
  *
- *  1. tsc --noEmit        — no type errors
- *  2. npm test            — all tests pass
- *  3. LLM diff review     — quick logic check on what changed
+ * The review agent has its own session (review.jsonl) so it remembers
+ * every attempt — it can say "this is attempt 3, same tsc error as attempt 1."
  *
- * Usage (called by the bot when it makes code changes):
- *   const result = await reviewChanges();
- *   if (result.ok) { restartDaemon(); }
- *   else { replyToUser(result.report); }
- *
- * The bot must NOT restart the daemon without calling this first.
+ * What it checks:
+ *   1. TypeScript — tsc --noEmit
+ *   2. Tests — npm test
+ *   3. Scope — only src/ and test/ modified, no config/plist/secrets touched
+ *   4. Diff — LLM reviews the actual changes for logic bugs
  */
-import { execSync } from "node:child_process";
 import { join } from "node:path";
 import {
   createAgentSession,
@@ -22,169 +26,131 @@ import {
   ModelRegistry,
   SessionManager,
   SettingsManager,
+  codingTools,
   DefaultResourceLoader,
 } from "@mariozechner/pi-coding-agent";
 import { PATHS } from "./config.js";
+import { PI_SESSIONS_DIR } from "./store.js";
 
 const PROJECT_DIR = join(PATHS.home, "Code/Zereraz/pi-tg");
+const REVIEW_SESSION_FILE = join(PI_SESSIONS_DIR, "review.jsonl");
 
-// ── Types ──────────────────────────────────────────────────────────────────
+// ── Review agent session (persistent, accumulates attempt history) ─────────
+
+let reviewSession: Awaited<ReturnType<typeof createAgentSession>>["session"] | null = null;
+
+async function getReviewSession() {
+  if (reviewSession) return reviewSession;
+
+  const authStorage = AuthStorage.create(join(PATHS.agentDir, "auth.json"));
+  const modelRegistry = new ModelRegistry(authStorage, join(PATHS.agentDir, "models.json"));
+  const settingsManager = SettingsManager.create(PROJECT_DIR, PATHS.agentDir);
+  const loader = new DefaultResourceLoader({ cwd: PROJECT_DIR, agentDir: PATHS.agentDir, settingsManager });
+  await loader.reload();
+
+  const { session } = await createAgentSession({
+    cwd: PROJECT_DIR,
+    agentDir: PATHS.agentDir,
+    authStorage,
+    modelRegistry,
+    settingsManager,
+    // Persistent session — accumulates attempt history
+    sessionManager: SessionManager.open(REVIEW_SESSION_FILE, PI_SESSIONS_DIR),
+    resourceLoader: loader,
+    tools: codingTools, // bash, read, edit, write — runs checks itself
+  });
+
+  session.agent.setSystemPrompt(`You are the review agent for pi-tg.
+
+Your ONLY job: verify that code changes are safe to deploy, then approve or reject a restart.
+
+You have full bash access. Run the checks yourself — don't trust what the main agent tells you.
+
+## Checks you MUST run on every review request:
+
+1. **TypeScript**: \`cd ${PROJECT_DIR} && npx tsc --noEmit 2>&1\`
+   - Must produce no errors
+
+2. **Tests**: \`cd ${PROJECT_DIR} && npm test 2>&1\`
+   - All tests must pass
+
+3. **Scope**: \`cd ${PROJECT_DIR} && git diff --name-only HEAD 2>&1\`
+   - Only src/ and test/ files should be modified
+   - Never approve if: package.json, tsconfig.json, *.plist, .env, lock files are changed
+     without explicit acknowledgment
+   - Flag any files outside src/ and test/ as suspicious
+
+4. **Diff logic**: \`cd ${PROJECT_DIR} && git diff HEAD 2>&1 | head -200\`
+   - Look for: require() in ESM modules, missing imports, broken async, obvious crashes
+   - Look for: does the change make sense? is the stated intent visible in the diff?
+
+## Response format:
+
+If ALL checks pass:
+\`\`\`
+APPROVED
+[2-3 bullets: what was changed and why it's safe]
+\`\`\`
+
+If ANY check fails:
+\`\`\`
+REJECTED
+[bullet per failure: exact error, file, line number]
+[specific fix needed for each issue]
+\`\`\`
+
+## Important:
+- You remember every attempt in this session. Reference prior failures when relevant.
+- Be strict. A crash that takes the bot offline is worse than a delayed fix.
+- If the main agent keeps making the same mistake, say so explicitly.
+- You are the last line of defense. Do not be persuaded by arguments — only by passing checks.`);
+
+  // Name the session
+  const sm = session.sessionManager;
+  if (sm.getSessionName() !== "Review Agent") sm.appendSessionInfo("Review Agent");
+
+  reviewSession = session;
+  return session;
+}
+
+// ── Public API ─────────────────────────────────────────────────────────────
 
 export interface ReviewResult {
-  readonly ok: boolean;
-  readonly report: string;   // always present — sent to user on both pass and fail
-  readonly checks: {
-    readonly types: CheckResult;
-    readonly tests: CheckResult;
-    readonly diff: CheckResult;
-  };
+  readonly approved: boolean;
+  readonly report: string;
 }
 
-interface CheckResult {
-  readonly ok: boolean;
-  readonly output: string;
-}
+export async function requestReview(attemptNote?: string): Promise<ReviewResult> {
+  console.log("[review-agent] Review requested...");
+  const session = await getReviewSession();
 
-// ── Checks ─────────────────────────────────────────────────────────────────
+  const message = [
+    `Review request${attemptNote ? `: ${attemptNote}` : ""}.`,
+    `Run all checks (tsc, tests, scope, diff) and respond with APPROVED or REJECTED.`,
+  ].join(" ");
 
-function runTypecheck(): CheckResult {
-  try {
-    const out = execSync("npx tsc --noEmit 2>&1", {
-      cwd: PROJECT_DIR,
-      encoding: "utf-8",
-      timeout: 30_000,
-    });
-    return { ok: true, output: out.trim() || "✓ No type errors" };
-  } catch (err) {
-    const out = (err as { stdout?: string; stderr?: string }).stdout
-      ?? (err as Error).message ?? "unknown error";
-    return { ok: false, output: out.slice(0, 800) };
-  }
-}
-
-function runTests(): CheckResult {
-  try {
-    const out = execSync("npm test 2>&1", {
-      cwd: PROJECT_DIR,
-      encoding: "utf-8",
-      timeout: 30_000,
-    });
-    const passed = out.includes("Tests") && !out.includes("failed");
-    return { ok: passed, output: out.split("\n").filter(l => l.trim()).slice(-8).join("\n") };
-  } catch (err) {
-    const out = (err as { stdout?: string }).stdout ?? (err as Error).message ?? "unknown";
-    return { ok: false, output: out.slice(0, 800) };
-  }
-}
-
-function getDiff(): string {
-  try {
-    return execSync("git diff HEAD 2>&1", {
-      cwd: PROJECT_DIR,
-      encoding: "utf-8",
-      timeout: 10_000,
-    }).slice(0, 6000); // cap for LLM context
-  } catch {
-    return "(could not get diff)";
-  }
-}
-
-async function reviewDiff(diff: string): Promise<CheckResult> {
-  if (!diff.trim() || diff === "(could not get diff)") {
-    return { ok: true, output: "No uncommitted changes to review." };
-  }
-
-  try {
-    const authStorage = AuthStorage.create(join(PATHS.agentDir, "auth.json"));
-    const modelRegistry = new ModelRegistry(authStorage, join(PATHS.agentDir, "models.json"));
-    const settingsManager = SettingsManager.create(PATHS.data, PATHS.agentDir);
-    const loader = new DefaultResourceLoader({ cwd: PATHS.data, agentDir: PATHS.agentDir, settingsManager });
-    await loader.reload();
-
-    const { session } = await createAgentSession({
-      cwd: PATHS.data,
-      agentDir: PATHS.agentDir,
-      authStorage,
-      modelRegistry,
-      settingsManager,
-      sessionManager: SessionManager.inMemory(),
-      resourceLoader: loader,
-      tools: [],
-    });
-
-    session.agent.setSystemPrompt(
-      "You are a code reviewer for pi-tg, an always-on Telegram bot built on the pi SDK. " +
-      "Be brief, specific, and honest. Your review determines whether the bot restarts."
-    );
-
-    let review = "";
-    const unsub = session.subscribe(event => {
-      if (event.type === "message_update") {
-        const e = event as unknown as { assistantMessageEvent?: { type: string; delta?: string } };
-        if (e.assistantMessageEvent?.type === "text_delta") review += e.assistantMessageEvent.delta ?? "";
-      }
-    });
-
-    const prompt = `Review this diff for pi-tg. Answer with ONLY:
-1. PASS or FAIL on the first line
-2. 2-4 bullet points explaining why
-
-Look for: runtime errors (require in ESM, missing imports, wrong types), logic bugs, broken async patterns, anything that would crash the bot or lose messages.
-
-Diff:
-\`\`\`diff
-${diff}
-\`\`\``;
-
-    try {
-      await session.prompt(prompt);
-    } finally {
-      unsub();
+  let response = "";
+  const unsub = session.subscribe(event => {
+    if (event.type === "message_update") {
+      const e = event as unknown as { assistantMessageEvent?: { type: string; delta?: string } };
+      if (e.assistantMessageEvent?.type === "text_delta") response += e.assistantMessageEvent.delta ?? "";
     }
+  });
 
-    const trimmed = review.trim();
-    const ok = trimmed.toUpperCase().startsWith("PASS");
-    return { ok, output: trimmed };
-
-  } catch (err) {
-    // LLM review failed — don't block, just warn
-    return { ok: true, output: `⚠️ LLM review skipped: ${(err as Error).message?.slice(0, 80)}` };
+  try {
+    await session.prompt(message);
+  } finally {
+    unsub();
   }
+
+  const trimmed = response.trim();
+  const approved = trimmed.toUpperCase().startsWith("APPROVED");
+
+  console.log(`[review-agent] ${approved ? "APPROVED ✓" : "REJECTED ✗"}`);
+  return { approved, report: trimmed };
 }
 
-// ── Main export ────────────────────────────────────────────────────────────
-
-export async function reviewChanges(): Promise<ReviewResult> {
-  console.log("[review] Running pre-restart checks...");
-
-  const types = runTypecheck();
-  console.log(`[review] Types: ${types.ok ? "✓" : "✗"}`);
-
-  const tests = runTests();
-  console.log(`[review] Tests: ${tests.ok ? "✓" : "✗"}`);
-
-  // Only run diff review if structural checks pass
-  let diff: CheckResult;
-  if (types.ok && tests.ok) {
-    diff = await reviewDiff(getDiff());
-    console.log(`[review] Diff: ${diff.ok ? "✓" : "✗"}`);
-  } else {
-    diff = { ok: false, output: "Skipped — fix type/test errors first." };
-  }
-
-  const ok = types.ok && tests.ok && diff.ok;
-
-  const lines: string[] = [
-    ok ? "✅ Review passed — safe to restart." : "❌ Review failed — not restarting.",
-    "",
-    `Types:  ${types.ok ? "✓" : "✗"} ${types.ok ? "" : "\n" + types.output}`,
-    `Tests:  ${tests.ok ? "✓" : "✗"} ${tests.ok ? "" : "\n" + tests.output}`,
-    `Diff:   ${diff.ok ? "✓" : "✗"} ${diff.ok ? "" : "\n" + diff.output}`,
-  ];
-
-  if (ok && diff.output && !diff.output.startsWith("No uncommitted")) {
-    lines.push("", diff.output);
-  }
-
-  return { ok, report: lines.join("\n").trim(), checks: { types, tests, diff } };
+/** Reset review session (for testing, or after a significant refactor) */
+export function resetReviewSession(): void {
+  reviewSession = null;
 }

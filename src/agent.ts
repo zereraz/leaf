@@ -29,7 +29,7 @@ import { readProjects, readMemory, readUser, readIgneIndex, readTodayLog } from 
 import { notifyOwner } from "./telegram.js";
 import { acquireFileLock } from "./lock.js";
 import { spawnSubAgent, activeSubAgents } from "./subagent.js";
-import { reviewChanges } from "./review-agent.js";
+import { requestReview } from "./review-agent.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -147,31 +147,31 @@ const spawnAgentTool: ToolDefinition = {
  */
 const restartBotTool: ToolDefinition = {
   name: "restart_bot",
-  label: "Restart Bot (with review gate)",
+  label: "Restart Bot (review gate)",
   description: [
-    "Review code changes and restart pi-tg if all checks pass.",
-    "Runs: tsc --noEmit, npm test, LLM diff review.",
-    "Will NOT restart if any check fails — reports what's wrong instead.",
-    "Use after making code changes to pi-tg source files.",
+    "Submit code changes for review. The review agent runs tsc, tests, scope check, and diff analysis.",
+    "It has its own session and remembers all previous attempts.",
+    "If checks fail, it tells you exactly what to fix — fix it and call this again.",
+    "Only restarts when the review agent approves. You cannot bypass this.",
   ].join(" "),
-  parameters: Type.Object({}),
-  execute: async () => {
-    const result = await reviewChanges();
-    if (result.ok) {
-      // Restart in background after sending response
+  parameters: Type.Object({
+    note: Type.Optional(Type.String({ description: "What you changed and why (helps the review agent)" })),
+  }),
+  execute: async (_id, params: { note?: string }) => {
+    const result = await requestReview(params.note);
+    if (result.approved) {
       setTimeout(() => {
         try {
-          execSync("launchctl unload ~/Library/LaunchAgents/ai.pi.tg.plist && sleep 1 && launchctl load ~/Library/LaunchAgents/ai.pi.tg.plist", {
-            shell: "/bin/bash",
-            timeout: 15_000,
-            env: { ...process.env, HOME: PATHS.home },
-          });
-        } catch { /* process exits during restart — expected */ }
+          execSync(
+            `launchctl unload ~/Library/LaunchAgents/ai.pi.tg.plist && sleep 1 && launchctl load ~/Library/LaunchAgents/ai.pi.tg.plist`,
+            { shell: "/bin/bash", timeout: 15_000, env: { ...process.env, HOME: PATHS.home } },
+          );
+        } catch { /* process exits on restart — expected */ }
       }, 2000);
     }
     return {
       content: [{ type: "text" as const, text: result.report }],
-      details: { ok: result.ok },
+      details: { approved: result.approved },
     };
   },
 };

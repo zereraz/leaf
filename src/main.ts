@@ -1,12 +1,17 @@
 /**
  * main.ts — entry point.
- * Starts the Telegram bot + proactive scheduler in one process.
- * Managed by launchd (KeepAlive: true).
+ *
+ * Creates the transport (TelegramTransport) and injects it into the bot.
+ * To switch to WhatsApp: replace TelegramTransport with WhatsAppTransport here.
+ * Nothing else changes.
  */
 import { initStore } from "./store.js";
-import { startBot, stopBot } from "./bot.js";
+import { createBot } from "./bot.js";
 import { startScheduler, stopScheduler, forceMode } from "./scheduler.js";
+import { TelegramTransport } from "./telegram.js";
 import { notifyOwner } from "./telegram.js";
+import { warmupSession } from "./agent.js";
+import { TG } from "./config.js";
 import type { SchedulerMode } from "./config.js";
 
 // ── CLI args ────────────────────────────────────────────────────────────────
@@ -29,18 +34,23 @@ if (forceModeArg) {
   process.exit(0);
 }
 
-// ── Start both systems ──────────────────────────────────────────────────────
-startScheduler();
-void startBot(); // long-polls forever — returns only when stopBot() is called
+// ── Transport — swap here for WhatsApp, Discord, etc. ──────────────────────
+const transport = new TelegramTransport(TG.ownerChatId);
 
-// Startup notification
-notifyOwner("👋 pi-tg online").catch(() => {});
+// ── Bot + scheduler ─────────────────────────────────────────────────────────
+const bot = createBot(transport);
+
+startScheduler();
+void bot.start();
+
+// Warm session — first message pays no init cost
+void warmupSession();
 
 // ── Graceful shutdown ───────────────────────────────────────────────────────
 function shutdown(signal: string): void {
   console.log(`[pi-tg] ${signal}. Shutting down.`);
   stopScheduler();
-  stopBot();
+  bot.stop();
   process.exit(0);
 }
 

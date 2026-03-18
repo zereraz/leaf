@@ -244,3 +244,146 @@ function splitText(text: string, maxLen: number): string[] {
   }
   return chunks;
 }
+
+// ── TelegramTransport — implements Transport interface ─────────────────────
+
+import type {
+  Transport, TransportConfig, MessageContext,
+  IncomingMessage as TransportMessage, SentMessage, SendOptions,
+} from "./transport.js";
+
+const STATUS_EMOJI: Record<"working" | "done" | "error", string> = {
+  working: "⌛",
+  done: "✅",
+  error: "⚠️",
+};
+
+class TelegramMessageContext implements MessageContext {
+  readonly source: TransportMessage;
+  private readonly chatId: number;
+
+  constructor(msg: TransportMessage) {
+    this.source = msg;
+    this.chatId = msg.chatId;
+  }
+
+  async send(text: string, opts?: SendOptions): Promise<SentMessage> {
+    const tgOpts: SendMessageOptions = {
+      ...(opts?.replyToId ? { reply_parameters: { message_id: opts.replyToId } } : {}),
+      ...(opts?.copyable ? { reply_markup: copyButton(opts.copyText ?? text) } : {}),
+    };
+    const sent = await sendMessage(this.chatId, text, tgOpts);
+    return { id: sent.message_id, chatId: this.chatId };
+  }
+
+  async placeholder(): Promise<SentMessage> {
+    const id = await sendPlaceholder(this.chatId, this.source.id);
+    return { id, chatId: this.chatId };
+  }
+
+  async update(msgId: number, text: string): Promise<void> {
+    await editMessage(this.chatId, msgId, text);
+  }
+
+  async finish(msgId: number, text: string, opts?: SendOptions): Promise<void> {
+    await editMessage(this.chatId, msgId, text, {
+      ...(opts?.copyable ? { reply_markup: copyButton(opts.copyText ?? text) } : {}),
+    });
+  }
+
+  async typing(): Promise<void> {
+    await sendTyping(this.chatId);
+  }
+
+  async setStatus(status: "working" | "done" | "error" | null): Promise<void> {
+    await setReaction(this.chatId, this.source.id, status ? (STATUS_EMOJI[status] ?? null) : null);
+  }
+}
+
+export class TelegramTransport implements Transport {
+  readonly config: TransportConfig;
+  private _polling = false;
+
+  constructor(ownerChatId: number) {
+    this.config = { ownerChatId };
+  }
+
+  contextFor(msg: TransportMessage): MessageContext {
+    return new TelegramMessageContext(msg);
+  }
+
+  async notifyOwner(text: string): Promise<SentMessage> {
+    const sent = await sendMessage(this.config.ownerChatId, text);
+    return { id: sent.message_id, chatId: this.config.ownerChatId };
+  }
+
+  async start(onMessage: (msg: TransportMessage) => Promise<void>): Promise<void> {
+    this._polling = true;
+    let offset = 0;
+    let backoffMs = 1_000;
+    let wasOffline = false;
+    let offlineSince = 0;
+
+    // Load persisted offset
+    try {
+      const { readState } = await import("./store.js");
+      offset = readState().offset;
+    } catch { /* ok — fresh start */ }
+
+    while (this._polling) {
+      try {
+        const updates = await getUpdates(offset, TG.pollTimeoutSecs);
+        backoffMs = 1_000;
+
+        if (wasOffline) {
+          wasOffline = false;
+          const down = Math.round((Date.now() - offlineSince) / 1000);
+          const label = down < 60 ? `${down}s` : `${Math.round(down / 60)}m`;
+          console.log("[transport:tg] Back online.");
+          await this.notifyOwner(`🟢 Back online. (down ${label})`).catch(() => {});
+        }
+
+        for (const update of updates) {
+          offset = update.update_id + 1;
+          // Persist offset immediately
+          try {
+            const { updateState } = await import("./store.js");
+            updateState(s => { s.offset = offset; });
+          } catch { /* ok */ }
+
+          const msg = update.message;
+          if (!msg?.text) continue;
+          if (msg.chat.id !== this.config.ownerChatId) continue;
+
+          await onMessage({
+            id: msg.message_id,
+            chatId: msg.chat.id,
+            text: msg.text.trim(),
+            fromId: msg.from?.id ?? 0,
+            timestamp: msg.date * 1000,
+          });
+        }
+      } catch (err) {
+        if (err instanceof TgApiError && err.isConflict()) {
+          console.warn(`[transport:tg] Conflict — backing off ${backoffMs}ms…`);
+          await sleep(backoffMs);
+          backoffMs = Math.min(backoffMs * 2, 60_000);
+        } else {
+          if (!wasOffline) {
+            wasOffline = true;
+            offlineSince = Date.now();
+            console.warn("[transport:tg] Offline:", (err as Error).message?.slice(0, 80));
+          }
+          await sleep(Math.min(backoffMs, 15_000));
+          backoffMs = Math.min(backoffMs * 2, 60_000);
+        }
+      }
+    }
+  }
+
+  stop(): void { this._polling = false; }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
