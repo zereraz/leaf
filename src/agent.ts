@@ -8,6 +8,8 @@
  * System prompt rebuilt fresh on every run from memory files.
  */
 import { join } from "node:path";
+import { statSync } from "node:fs";
+import { execSync } from "node:child_process";
 import {
   createAgentSession,
   AuthStorage,
@@ -27,6 +29,7 @@ import { readProjects, readMemory, readUser, readIgneIndex, readTodayLog } from 
 import { notifyOwner } from "./telegram.js";
 import { acquireFileLock } from "./lock.js";
 import { spawnSubAgent, activeSubAgents } from "./subagent.js";
+import { reviewChanges } from "./review-agent.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -57,6 +60,16 @@ const cache = new Map<string, CachedSession>();
 
 export function evictSession(name: string): void {
   cache.delete(name);
+}
+
+/** Pre-warm the main session at startup so first message is instant. */
+export async function warmupSession(): Promise<void> {
+  try {
+    await getOrCreateSession(MAIN);
+    console.log("[agent] Session warmed up.");
+  } catch (err) {
+    console.warn("[agent] Warmup failed (non-fatal):", (err as Error).message);
+  }
 }
 
 // ── In-process + file mutex ────────────────────────────────────────────────
@@ -104,7 +117,8 @@ const spawnAgentTool: ToolDefinition = {
     cwd:     Type.Optional(Type.String({ description: "Working directory (e.g. ~/Code/Zereraz/eidos)" })),
     context: Type.Optional(Type.String({ description: "Extra context to pass (file paths, notes)" })),
   }),
-  execute: async (_id, params: Static<typeof spawnAgentTool.parameters>) => {
+  execute: async (_id, params) => {
+    const p = params as { task: string; cwd?: string; context?: string };
     const ctx = currentMsgCtx.get(MAIN_CONVERSATION);
     if (!ctx) return { content: [{ type: "text" as const, text: "Error: no message context" }], details: {} };
 
@@ -112,11 +126,11 @@ const spawnAgentTool: ToolDefinition = {
     const agentId = `agent-${spawnCounter}`;
     await spawnSubAgent({
       id: agentId,
-      task: params.task,
+      task: p.task,
       chatId: ctx.chatId,
       replyToMsgId: ctx.replyToMsgId,
-      cwd: params.cwd,
-      context: params.context,
+      ...(p.cwd ? { cwd: p.cwd } : {}),
+      ...(p.context ? { context: p.context } : {}),
     });
 
     return {
@@ -126,13 +140,72 @@ const spawnAgentTool: ToolDefinition = {
   },
 };
 
+/**
+ * restart_bot — review changes then reload the daemon.
+ * MUST pass review-agent before launchctl reload is called.
+ * The bot enforces this: it will not restart without a passing review.
+ */
+const restartBotTool: ToolDefinition = {
+  name: "restart_bot",
+  label: "Restart Bot (with review gate)",
+  description: [
+    "Review code changes and restart pi-tg if all checks pass.",
+    "Runs: tsc --noEmit, npm test, LLM diff review.",
+    "Will NOT restart if any check fails — reports what's wrong instead.",
+    "Use after making code changes to pi-tg source files.",
+  ].join(" "),
+  parameters: Type.Object({}),
+  execute: async () => {
+    const result = await reviewChanges();
+    if (result.ok) {
+      // Restart in background after sending response
+      setTimeout(() => {
+        try {
+          execSync("launchctl unload ~/Library/LaunchAgents/ai.pi.tg.plist && sleep 1 && launchctl load ~/Library/LaunchAgents/ai.pi.tg.plist", {
+            shell: "/bin/bash",
+            timeout: 15_000,
+            env: { ...process.env, HOME: PATHS.home },
+          });
+        } catch { /* process exits during restart — expected */ }
+      }, 2000);
+    }
+    return {
+      content: [{ type: "text" as const, text: result.report }],
+      details: { ok: result.ok },
+    };
+  },
+};
+
 import { readContextBrief } from "./context-agent.js";
 
-// ── System prompt ──────────────────────────────────────────────────────────
+// ── System prompt — cached, rebuilds only when files change ───────────────
+
+interface PromptCache {
+  prompt: string;
+  builtAt: number;
+  mtimes: string;
+}
+
+let promptCache: PromptCache | null = null;
+const PROMPT_TTL_MS = 60_000; // max 1 min stale
+
+function promptFileMtimes(): string {
+  return [PATHS.projects, PATHS.memory, PATHS.user].map(p => {
+    try { return statSync(p).mtimeMs; } catch { return 0; }
+  }).join(",");
+}
 
 function buildSystemPrompt(identity: SessionIdentity): string {
+  const now = Date.now();
+  const mtimes = promptFileMtimes();
+
+  // Return cached if files unchanged and within TTL
+  if (promptCache && (now - promptCache.builtAt < PROMPT_TTL_MS) && promptCache.mtimes === mtimes) {
+    return promptCache.prompt;
+  }
+
   const running = activeSubAgents();
-  return `You are pi — saheb's always-on AI companion on Telegram.${identity.cwd ? `\nWorking directory: ${identity.cwd}` : ""}
+  const prompt = `You are pi — saheb's always-on AI companion on Telegram.${identity.cwd ? `\nWorking directory: ${identity.cwd}` : ""}
 
 ## User
 ${readUser() || "Name: Sahebjot (saheb). Timezone: Asia/Calcutta."}
@@ -157,9 +230,14 @@ ${running.length > 0 ? running.map(a => `• ${a.id}: ${a.task.slice(0, 60)}`).j
 - Scheduler prompts ([SCHEDULER:mode]): use the context brief above to say something SPECIFIC, not generic. Reply ${SILENT_TOKEN} if nothing genuine to say.
 - When saheb shares decisions or thoughts: save them to ~/pi-tg/memory/projects.md
 - For code, files, multi-step tasks: use spawn_agent — it runs in parallel and keeps you free
-- For quick answers, lookups, memory updates: respond yourself
-- When saheb shares thoughts about a project: save them to ~/pi-tg/memory/projects.md
-- Scheduler prompts ([SCHEDULER:mode]): reply ${SILENT_TOKEN} if nothing worth saying`;
+- **After making any code change to pi-tg: ALWAYS call restart_bot — never use launchctl directly**
+  - restart_bot runs tsc + tests + LLM diff review before restarting
+  - If review fails it reports what's wrong without restarting
+  - This is the safety gate — never bypass it
+- For quick answers, lookups, memory updates: respond yourself`;
+
+  promptCache = { prompt, builtAt: now, mtimes };
+  return prompt;
 }
 
 // ── Session factory ────────────────────────────────────────────────────────
@@ -183,7 +261,7 @@ export async function getOrCreateSession(identity: SessionIdentity): Promise<Cac
   await loader.reload();
 
   const tools = identity.name === MAIN_CONVERSATION
-    ? [...codingTools, spawnAgentTool]
+    ? [...codingTools, spawnAgentTool as unknown as (typeof codingTools)[number], restartBotTool as unknown as (typeof codingTools)[number]]
     : codingTools;
 
   const { session } = await createAgentSession({
