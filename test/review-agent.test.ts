@@ -173,46 +173,53 @@ function promptFileMtimes(): string {
 const INTEGRATION = process.env["REVIEW_INTEGRATION"] === "1";
 
 describe.skipIf(!INTEGRATION)("review agent integration (live LLM)", () => {
+
   it("rejects the require() ESM bug that tsc and tests both miss", async () => {
-    // This is the exact scenario that crashed the bot in production.
-    // tsc: passes (require is typed in @types/node)
-    // npm test: passes (no test exercises the code path)
-    // diff review: MUST catch it
+    // The exact crash that hit production — tsc:pass, tests:pass, runtime:crash
+    const fs = await import("node:fs");
+    const { resetReviewSession } = await import("../src/review-agent.js");
 
-    const { requestReview, resetReviewSession } = await import("../src/review-agent.js");
-
-    // Introduce the bug
     const agentPath = join(process.cwd(), "src/agent.ts");
-    const original = (await import("node:fs")).readFileSync(agentPath, "utf-8");
+    const original = fs.readFileSync(agentPath, "utf-8");
     const broken = original.replace(
       "function promptFileMtimes(): string {\n  return",
       "function promptFileMtimes(): string {\n  const { statSync } = require(\"node:fs\");\n  return",
     );
 
+    if (!broken.includes('require("node:fs")')) {
+      throw new Error("Could not inject the bug — check the target string");
+    }
+
     try {
-      (await import("node:fs")).writeFileSync(agentPath, broken);
+      fs.writeFileSync(agentPath, broken);
       resetReviewSession();
+      const { requestReview } = await import("../src/review-agent.js");
 
       const result = await requestReview("Added require() call for statSync");
 
       expect(result.approved).toBe(false);
-      // Must mention require or ESM in the issue
       const mentionsRequire = result.issues.some(i =>
         i.toLowerCase().includes("require") || i.toLowerCase().includes("esm")
       );
       expect(mentionsRequire).toBe(true);
     } finally {
-      // Always restore
-      (await import("node:fs")).writeFileSync(agentPath, original);
+      fs.writeFileSync(agentPath, original); // always restore
     }
-  }, 120_000); // 2 min timeout for LLM
+  }, 5 * 60_000); // 5 min
 
-  it("approves a clean diff", async () => {
+  it("approves a clean committed state", async () => {
+    // Ensure working tree is clean before running
+    const { execSync } = await import("node:child_process");
+    const dirty = execSync("git diff --name-only HEAD", { encoding: "utf-8", cwd: process.cwd() }).trim();
+    if (dirty) {
+      throw new Error(`Working tree has uncommitted changes: ${dirty}\nCommit them before running integration tests.`);
+    }
+
     const { requestReview, resetReviewSession } = await import("../src/review-agent.js");
     resetReviewSession();
 
-    const result = await requestReview("No changes — verifying clean state");
+    const result = await requestReview("Verifying clean committed state");
     expect(result.approved).toBe(true);
     expect(result.issues).toHaveLength(0);
-  }, 120_000);
+  }, 5 * 60_000); // 5 min
 });

@@ -16,6 +16,7 @@
  * The review agent sees every prior attempt and can reference them.
  */
 import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { Type } from "@sinclair/typebox";
 import {
   createAgentSession,
@@ -188,4 +189,6 @@ export async function requestReview(note?: string): Promise<ReviewResult> {
 export function resetReviewSession(): void {
   reviewSession = null;
   pendingReview = null;
+  // Truncate session file so integration tests start with clean state
+  try { writeFileSync(REVIEW_SESSION_FILE, "", "utf-8"); } catch { /* ok if missing */ }
 }

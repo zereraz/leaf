@@ -56,7 +56,6 @@ export function createBot(transport: Transport) {
     let activeTool = "";
     let draftTimer: NodeJS.Timeout | null = null;
     let typingTimer: NodeJS.Timeout | null = null;
-    let firstEditDone = false;
 
     const buildDisplay = (): string => {
       if (latestContent.length > 0) return latestContent;
@@ -87,20 +86,20 @@ export function createBot(transport: Transport) {
       const chunk = display.slice(committedChars);
       if (!chunk || chunk === lastEditedText) return;
 
-      if (!firstEditDone) {
-        firstEditDone = true;
-        if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
-      }
-
-      if (chunk.length <= NEAR_MAX) {
-        await ctx.update(activeMsgId!, chunk);
-        lastEditedText = chunk;
-      } else {
-        await ctx.update(activeMsgId!, chunk.slice(0, NEAR_MAX));
-        committedChars += NEAR_MAX;
-        const next = await ctx.placeholder();
-        activeMsgId = next.id;
-        lastEditedText = "";
+      try {
+        if (chunk.length <= NEAR_MAX) {
+          await ctx.update(activeMsgId!, chunk);
+          lastEditedText = chunk;
+        } else {
+          await ctx.update(activeMsgId!, chunk.slice(0, NEAR_MAX));
+          committedChars += NEAR_MAX;
+          const next = await ctx.placeholder();
+          activeMsgId = next.id;
+          lastEditedText = "";
+        }
+      } catch (err) {
+        // Log but don't crash the interval — next tick will retry
+        console.warn("[bot] flushEdit error:", (err as Error).message?.slice(0, 80));
       }
     };
 
@@ -110,7 +109,11 @@ export function createBot(transport: Transport) {
       const { text: response } = await runMessage(
         text, ts,
         { chatId, replyToMsgId: userMsgId },
-        (acc) => { latestContent = acc; },
+        (acc) => {
+          latestContent = acc;
+          // Stop typing only when real text arrives
+          if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+        },
         (name, args) => { activeTool = formatToolCall(name, args); },
         (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; },
       );
