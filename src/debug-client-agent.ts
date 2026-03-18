@@ -196,14 +196,54 @@ SUGGESTION: how to fix it`;
 
 // ── /debug command data ────────────────────────────────────────────────────
 
+/** Track active message state — bot.ts updates this in real-time */
+export interface ActiveMessageState {
+  userMsgId: number;
+  startedAt: number;
+  activeMsgId: number | null;
+  latestContent: string;
+  lastEditedText: string;
+  toolLog: string[];
+  activeTool: string;
+  editCount: number;
+  rateLimitHits: number;
+  editErrors: string[];
+  isTyping: boolean;
+  phase: "idle" | "tools" | "streaming" | "finalizing" | "done" | "error";
+}
+
+let _activeState: ActiveMessageState | null = null;
+
+export function setActiveState(state: ActiveMessageState | null): void {
+  _activeState = state;
+}
+
+export function getActiveState(): ActiveMessageState | null {
+  return _activeState;
+}
+
 export interface DebugSnapshot {
+  readonly active: {
+    phase: string;
+    elapsed: number;
+    contentLen: number;
+    lastEditedLen: number;
+    editCount: number;
+    rateLimitHits: number;
+    errors: string[];
+    isTyping: boolean;
+    activeTool: string;
+    toolsRun: number;
+    preview: string;
+  } | null;
   readonly lastMessages: Array<{
     ts: number;
     agentLen: number;
     sentLen: number | null;
     mismatch: boolean;
     diagnosis?: DiagnosisResult | undefined;
-    preview: string;
+    agentPreview: string;
+    sentPreview: string | null;
   }>;
   readonly recentMismatches: number;
   readonly botState: {
@@ -227,11 +267,30 @@ export function getDebugSnapshot(n: number): DebugSnapshot {
       sentLen: entry.sentText?.length ?? null,
       mismatch: entry.sentText != null,
       diagnosis: matchingReport?.diagnosis,
-      preview: entry.text.slice(0, 500),
+      agentPreview: entry.text.slice(0, 800),
+      sentPreview: entry.sentText?.slice(0, 800) ?? null,
     };
   });
 
+  let active: DebugSnapshot["active"] = null;
+  if (_activeState && _activeState.phase !== "idle" && _activeState.phase !== "done") {
+    active = {
+      phase: _activeState.phase,
+      elapsed: Date.now() - _activeState.startedAt,
+      contentLen: _activeState.latestContent.length,
+      lastEditedLen: _activeState.lastEditedText.length,
+      editCount: _activeState.editCount,
+      rateLimitHits: _activeState.rateLimitHits,
+      errors: _activeState.editErrors,
+      isTyping: _activeState.isTyping,
+      activeTool: _activeState.activeTool,
+      toolsRun: _activeState.toolLog.length,
+      preview: _activeState.latestContent.slice(-300) || _activeState.activeTool || "(no content yet)",
+    };
+  }
+
   return {
+    active,
     lastMessages,
     recentMismatches: recentReports.filter(r => r.diagnosis).length,
     botState: {
@@ -244,26 +303,49 @@ export function getDebugSnapshot(n: number): DebugSnapshot {
 export function formatDebugSnapshot(snap: DebugSnapshot): string {
   const lines: string[] = [];
   
-  lines.push(`🔍 Debug — ${snap.botState.reportsTracked} reports tracked, ${snap.recentMismatches} mismatches, uptime ${Math.round(snap.botState.uptime / 60)}m`);
-  lines.push("");
+  lines.push(`🔍 Debug — uptime ${Math.round(snap.botState.uptime / 60)}m, ${snap.botState.reportsTracked} reports, ${snap.recentMismatches} mismatches`);
 
+  // Active message state
+  if (snap.active) {
+    const a = snap.active;
+    const elapsed = a.elapsed < 60000 ? `${Math.round(a.elapsed / 1000)}s` : `${Math.round(a.elapsed / 60000)}m`;
+    lines.push("");
+    lines.push(`⚡ ACTIVE — ${a.phase} (${elapsed})`);
+    lines.push(`  typing: ${a.isTyping ? "yes" : "no"}, edits: ${a.editCount}, rate-limits: ${a.rateLimitHits}`);
+    lines.push(`  content: ${a.contentLen} chars, last edit: ${a.lastEditedLen} chars, tools: ${a.toolsRun}`);
+    if (a.activeTool) lines.push(`  🔧 ${a.activeTool}`);
+    if (a.errors.length > 0) lines.push(`  ❌ errors: ${a.errors.slice(-3).join(", ")}`);
+    lines.push(`  preview: ${a.preview.slice(0, 200)}`);
+  } else {
+    lines.push("\n💤 No active message");
+  }
+
+  // Recent messages
   for (const msg of snap.lastMessages) {
     const time = new Date(msg.ts).toLocaleString("en-IN", { timeZone: "Asia/Calcutta" });
-    const status = msg.mismatch ? "⚠️ MISMATCH" : "✅ OK";
-    lines.push(`--- ${time} (${msg.agentLen} chars) ${status} ---`);
+    const status = msg.mismatch ? "⚠️ MISMATCH" : "✅";
+    lines.push("");
+    lines.push(`--- ${time} ${status} ---`);
 
     if (msg.mismatch && msg.sentLen != null) {
-      lines.push(`  agent=${msg.agentLen}, sent=${msg.sentLen}, lost=${msg.agentLen - msg.sentLen}`);
+      const lost = msg.agentLen - msg.sentLen;
+      lines.push(`agent: ${msg.agentLen} chars, sent: ${msg.sentLen} chars, lost: ${lost}`);
+    } else {
+      lines.push(`${msg.agentLen} chars`);
     }
 
     if (msg.diagnosis) {
-      lines.push(`  📋 ${msg.diagnosis.summary}`);
-      lines.push(`  🔧 ${msg.diagnosis.suggestion}`);
+      lines.push(`📋 ${msg.diagnosis.summary}`);
+      lines.push(`🔧 ${msg.diagnosis.suggestion}`);
     }
 
-    lines.push(msg.preview.slice(0, 300));
-    if (msg.preview.length > 300) lines.push("…[truncated]");
-    lines.push("");
+    // Show what agent produced
+    lines.push(`agent: ${msg.agentPreview.slice(0, 300)}${msg.agentPreview.length > 300 ? "…" : ""}`);
+    
+    // If mismatch, show what was actually sent
+    if (msg.sentPreview) {
+      lines.push(`sent: ${msg.sentPreview.slice(0, 300)}${msg.sentPreview.length > 300 ? "…" : ""}`);
+    }
   }
 
   return lines.join("\n").trim();

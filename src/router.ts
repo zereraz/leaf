@@ -92,7 +92,7 @@ function helpText(): string {
     "/status  — uptime & info",
     "/reset   — clear session context",
     "/agents  — list active sub-agents",
-    "/debug [n] — show last n bot messages from log (default 1, max 5)",
+    "/debug [n] — diagnose delivery: active state, last n messages, mismatches (default 3, max 10)",
     "/help    — this",
   ].join("\n");
 }

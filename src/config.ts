@@ -26,6 +26,8 @@ export const PATHS = {
   memory: join(LEAF_HOME, "MEMORY.md"),
   user: join(LEAF_HOME, "USER.md"),
   dailyLogs: join(LEAF_HOME, "memory"),
+  /** User's writing/docs paths — one per line in this file. Pi reads these to know the user's voice. */
+  writingPaths: join(LEAF_HOME, "writing-paths.txt"),
 } as const;
 
 export const SCHEDULER = {

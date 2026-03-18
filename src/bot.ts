@@ -14,13 +14,13 @@ import type { Transport, IncomingMessage } from "./transport.js";
 import { appendLog, seenUpdateIds } from "./store.js";
 import { route } from "./router.js";
 import { runMessage, formatToolCall, formatToolResult } from "./agent.js";
-import { recordDeliveryReport, diagnoseMismatch, type StreamingMeta } from "./debug-client-agent.js";
+import { recordDeliveryReport, diagnoseMismatch, setActiveState, type StreamingMeta, type ActiveMessageState } from "./debug-client-agent.js";
 
 // ── Bot ───────────────────────────────────────────────────────────────────
 
 export function createBot(transport: Transport) {
-  const EDIT_INTERVAL_MS = 2000;       // telegram-safe: 0.5 edits/sec
-  const MIN_DELTA_CHARS = 300;          // buffer ~10-15 tokens before editing
+  const EDIT_INTERVAL_MS = 2500;       // telegram-safe: ~0.4 edits/sec
+  const MIN_DELTA_CHARS = 600;          // buffer ~15-20 tokens before editing (reduces rate limit hits)
   const NEAR_MAX = 3700;
 
   async function handleMessage(msg: IncomingMessage): Promise<void> {
@@ -69,6 +69,23 @@ export function createBot(transport: Transport) {
     let rateLimitHits = 0;
     const editErrors: string[] = [];
 
+    // Debug state — exposed via /debug
+    const debugState: ActiveMessageState = {
+      userMsgId,
+      startedAt,
+      activeMsgId: null,
+      latestContent: "",
+      lastEditedText: "",
+      toolLog,
+      activeTool: "",
+      editCount: 0,
+      rateLimitHits: 0,
+      editErrors,
+      isTyping: false,
+      phase: "tools",
+    };
+    setActiveState(debugState);
+
     const buildDisplay = (): string => {
       // During text generation: show text + current tool at the bottom
       if (latestContent.length > 0) {
@@ -85,13 +102,16 @@ export function createBot(transport: Transport) {
     const cleanup = () => {
       if (draftTimer) { clearInterval(draftTimer); draftTimer = null; }
       if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+      debugState.isTyping = false;
     };
 
     // Start: status + placeholder + typing
     await ctx.setStatus("working");
     const placeholder = await ctx.placeholder();
     activeMsgId = placeholder.id;
+    debugState.activeMsgId = activeMsgId;
     typingTimer = setInterval(() => void ctx.typing(), 4_000);
+    debugState.isTyping = true;
     await ctx.typing();
 
     const flushEdit = async () => {
@@ -107,7 +127,7 @@ export function createBot(transport: Transport) {
       if (!hasText) {
         showingToolStatus = true;
         // Tool status changed — stop typing, show status
-        if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+        if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
       }
 
       const chunk = display.slice(committedChars);
@@ -119,9 +139,11 @@ export function createBot(transport: Transport) {
 
       try {
         editCount++;
+        debugState.editCount = editCount;
         if (chunk.length <= NEAR_MAX) {
           await ctx.update(activeMsgId!, chunk);
           lastEditedText = chunk;
+          debugState.lastEditedText = chunk;
         } else {
           await ctx.update(activeMsgId!, chunk.slice(0, NEAR_MAX));
           committedChars += NEAR_MAX;
@@ -133,6 +155,7 @@ export function createBot(transport: Transport) {
         const errMsg = (err as Error).message ?? "";
         if (errMsg.includes("429") || errMsg.includes("Too Many Requests")) {
           rateLimitHits++;
+          debugState.rateLimitHits = rateLimitHits;
           editErrors.push(`429 at edit #${editCount}`);
           console.warn("[bot] Rate limited, backing off 3s");
           await new Promise(r => setTimeout(r, 3000));
@@ -151,18 +174,23 @@ export function createBot(transport: Transport) {
         { chatId, replyToMsgId: userMsgId },
         (acc) => {
           latestContent = acc;
+          debugState.latestContent = acc;
+          debugState.phase = "streaming";
           // Stop typing when real text arrives
-          if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+          if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
         },
-        (name, args) => { activeTool = formatToolCall(name, args); },
-        (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; },
+        (name, args) => { activeTool = formatToolCall(name, args); debugState.activeTool = activeTool; },
+        (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; debugState.activeTool = ""; },
       );
 
       cleanup();
+      debugState.phase = "finalizing";
 
       if (!response) {
         await ctx.update(activeMsgId!, "\u200b"); // zero-width space
         await ctx.setStatus(null);
+        debugState.phase = "done";
+        setActiveState(null);
         return;
       }
 
@@ -196,6 +224,8 @@ export function createBot(transport: Transport) {
       }
 
       await ctx.setStatus("done");
+      debugState.phase = "done";
+      setActiveState(null);
 
       // ── Delivery tracking ──────────────────────────────────────────────
       const sentText = sentParts.join("");
@@ -229,6 +259,8 @@ export function createBot(transport: Transport) {
 
     } catch (err) {
       cleanup();
+      debugState.phase = "error";
+      setActiveState(null);
       console.error("[bot] Agent error:", err);
       await ctx.setStatus("error").catch(() => {});
       await ctx.send("⚠️ Something went wrong.").catch(() => {});

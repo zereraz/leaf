@@ -27,6 +27,27 @@ export function readTodayLog(): string {
   return readFileSafe(join(PATHS.dailyLogs, `${today}.md`), "(no log today)");
 }
 
+/** Read user's writing/docs paths from ~/leaf/writing-paths.txt (one path per line) */
+export function readWritingPaths(): string[] {
+  const raw = readFileSafe(PATHS.writingPaths, "");
+  return raw.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
+}
+
+/** Read contents of user's writing samples (first ~500 chars each) */
+export function readWritingSamples(): string {
+  const paths = readWritingPaths();
+  if (paths.length === 0) return "(no writing paths configured — add to ~/leaf/writing-paths.txt)";
+  const samples: string[] = [];
+  for (const p of paths) {
+    const resolved = p.startsWith("~") ? p.replace("~", PATHS.home) : p;
+    const content = readFileSafe(resolved, "");
+    if (content) {
+      samples.push(`--- ${p} ---\n${content.slice(0, 500)}${content.length > 500 ? "\n…" : ""}`);
+    }
+  }
+  return samples.join("\n\n") || "(writing paths configured but all empty)";
+}
+
 // ── Git activity (fd + git) ────────────────────────────────────────────────
 
 export interface RepoActivity {

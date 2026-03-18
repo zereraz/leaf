@@ -2,7 +2,7 @@
  * store.ts — persistence: state.json + log.jsonl
  *
  * Layout:
- *   ~/.pi/tg/
+ *   ~/leaf/data/
  *     state.json               — Telegram offset + scheduler state
  *     log.jsonl                — all messages (user + bot), append-only
  *

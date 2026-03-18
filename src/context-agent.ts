@@ -10,7 +10,7 @@
  *  - Most recent nama session (recent research)
  *  - Recent file modifications in active repos
  *
- * Outputs a "focus brief" written to ~/.pi/tg/context-brief.md
+ * Outputs a "focus brief" written to ~/leaf/data/context-brief.md
  * Cached for CACHE_TTL_MS so it doesn't run on every scheduler tick.
  *
  * Used by: scheduler.ts (before crafting proactive messages)
