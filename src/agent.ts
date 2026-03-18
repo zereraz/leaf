@@ -190,7 +190,6 @@ let promptCache: PromptCache | null = null;
 const PROMPT_TTL_MS = 60_000; // max 1 min stale
 
 function promptFileMtimes(): string {
-  const { statSync } = require("node:fs");
   return [PATHS.projects, PATHS.memory, PATHS.user].map(p => {
     try { return statSync(p).mtimeMs; } catch { return 0; }
   }).join(",");
