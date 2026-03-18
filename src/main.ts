@@ -45,6 +45,7 @@ void bot.start();
 
 // Warm session — first message pays no init cost
 void warmupSession();
+notifyOwner("👋 pi-tg online").catch(() => {});
 
 // ── Graceful shutdown ───────────────────────────────────────────────────────
 function shutdown(signal: string): void {
