@@ -22,6 +22,7 @@ export interface IncomingMessage {
   readonly fromId: number;   // sender platform ID
   readonly timestamp: number; // unix ms
   readonly replyToText?: string | undefined;  // text of the message being replied to (if any)
+  readonly phone?: string | undefined;   // sender phone number (E.164 format, WhatsApp only)
 }
 
 // ── Response context (per message) ───────────────────────────────────────

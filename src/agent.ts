@@ -1,8 +1,8 @@
 /**
  * agent.ts — pi SDK session management.
  *
- * One persistent AgentSession for the main Telegram conversation.
- * Sub-agents use getOrCreateSession() directly with their own identity.
+ * Supports per-user sessions for WhatsApp multi-user scenarios.
+ * Each user gets their own AgentSession with isolated conversation history.
  *
  * Auth via pi's standard AuthStorage (env vars: AWS_BEARER_TOKEN_BEDROCK etc.)
  * System prompt rebuilt fresh on every run from memory files.
@@ -22,6 +22,28 @@ import {
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
+import type { ExtensionFactory } from "@mariozechner/pi-coding-agent";
+
+// Dynamic system prompt extension - gets prompt from context
+const systemPromptExtension: ExtensionFactory = (pi) => {
+  pi.on("before_agent_start", async (_event, ctx) => {
+    // Get the prompt from the session identity stored in context
+    const sessionId = (ctx as unknown as { sessionId?: string }).sessionId ?? "main";
+    const prompt = getSystemPromptForSession(sessionId);
+    return { systemPrompt: prompt };
+  });
+};
+
+// Store per-session system prompts
+const sessionSystemPrompts = new Map<string, string>();
+
+function setSystemPromptForSession(sessionId: string, prompt: string): void {
+  sessionSystemPrompts.set(sessionId, prompt);
+}
+
+function getSystemPromptForSession(sessionId: string): string {
+  return sessionSystemPrompts.get(sessionId) ?? buildSystemPrompt(MAIN);
+}
 import { PATHS, MAIN_CONVERSATION, SILENT_TOKEN } from "./config.js";
 import { sessionFile, PI_SESSIONS_DIR, initStore } from "./store.js";
 import { syncLogToContext } from "./context.js";
@@ -30,6 +52,9 @@ import { notifyOwner } from "./telegram.js";
 import { acquireFileLock } from "./lock.js";
 import { spawnSubAgent, activeSubAgents } from "./subagent.js";
 import { requestReview } from "./review-agent.js";
+import { webSearchTool } from "./tools/web-search.js";
+import { webFetchTool } from "./tools/web-fetch.js";
+import { todoTool } from "./tools/todo.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -234,7 +259,14 @@ ${running.length > 0 ? running.map(a => `• ${a.id}: ${a.task.slice(0, 60)}`).j
   - restart_bot runs tsc + tests + LLM diff review before restarting
   - If review fails it reports what's wrong without restarting
   - This is the safety gate — never bypass it
-- For quick answers, lookups, memory updates: respond yourself`;
+- For quick answers, lookups, memory updates: respond yourself
+
+## Web Search & Research
+You have access to web search and research tools. Use them to answer questions:
+- **web_search**: Search Google for information (news, scholar, patents, general)
+- **web_fetch**: Fetch full content from URLs found in search results
+- **todo**: Track multi-step research tasks
+When asked a question, search for it first, then cite sources with URLs.`;
 
   promptCache = { prompt, builtAt: now, mtimes };
   return prompt;
@@ -257,12 +289,25 @@ export async function getOrCreateSession(identity: SessionIdentity): Promise<Cac
   // sessionDir = PI_SESSIONS_DIR so TUI /new, /fork, /resume land in the right place.
   const sm = SessionManager.open(sessionFile(identity.name), PI_SESSIONS_DIR);
 
-  const loader = new DefaultResourceLoader({ cwd, agentDir: PATHS.agentDir, settingsManager });
+  // Store system prompt for this session
+  const systemPrompt = buildSystemPrompt(identity);
+  setSystemPromptForSession(identity.name, systemPrompt);
+
+  // Use extension factories to hook into pi's lifecycle (like nama does)
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir: PATHS.agentDir,
+    settingsManager,
+    extensionFactories: [systemPromptExtension],
+  });
   await loader.reload();
 
+  // Core coding tools + agentic tools (web search, fetch, todo) + leaf-specific tools
+  const agenticTools = [webSearchTool, webFetchTool, todoTool] as any[];
+
   const tools = identity.name === MAIN_CONVERSATION
-    ? [...codingTools, spawnAgentTool as unknown as (typeof codingTools)[number], restartBotTool as unknown as (typeof codingTools)[number]]
-    : codingTools;
+    ? [...codingTools, ...agenticTools, spawnAgentTool as any, restartBotTool as any]
+    : [...codingTools, ...agenticTools];
 
   const { session } = await createAgentSession({
     cwd, agentDir: PATHS.agentDir,
@@ -270,7 +315,7 @@ export async function getOrCreateSession(identity: SessionIdentity): Promise<Cac
     sessionManager: sm, resourceLoader: loader, tools,
   });
 
-  session.agent.setSystemPrompt(buildSystemPrompt(identity));
+  // Extension handles system prompt via before_agent_start hook
 
   // Name the session so it shows correctly in `pi -r`
   const displayName = `Telegram — ${identity.name}`;
@@ -282,7 +327,146 @@ export async function getOrCreateSession(identity: SessionIdentity): Promise<Cac
   return result;
 }
 
-// ── Main conversation helpers ──────────────────────────────────────────────
+// ── Per-user session helpers ───────────────────────────────────────────────
+
+interface UserMsgContext { chatId: number; replyToMsgId: number; userPhone: string }
+const userMsgCtx = new Map<string, MsgContext>();
+
+/**
+ * Build a user-specific system prompt.
+ * Similar to buildSystemPrompt but personalized per user.
+ */
+function buildUserSystemPrompt(identity: SessionIdentity, userPhone: string): string {
+  const now = Date.now();
+  const mtimes = promptFileMtimes();
+
+  // Return cached if files unchanged and within TTL
+  if (promptCache && (now - promptCache.builtAt < PROMPT_TTL_MS) && promptCache.mtimes === mtimes) {
+    return promptCache.prompt;
+  }
+
+  const running = activeSubAgents();
+  const prompt = `You are leaf — an AI assistant on WhatsApp.
+You are chatting with user: ${userPhone}
+${identity.cwd ? `\nWorking directory: ${identity.cwd}` : ""}
+
+## User
+Phone: ${userPhone}
+${readUser() || "Timezone: Asia/Calcutta."}
+
+## What user is currently focused on
+${readContextBrief()}
+
+## Projects memory
+${readProjects()}
+
+## Long-term memory
+${readMemory()}
+
+## Active sub-agents
+${running.length > 0 ? running.map(a => `• ${a.id}: ${a.task.slice(0, 60)}`).join("\n") : "none"}
+
+## Behavior
+- Concise responses — readable on mobile, no markdown headers
+- Use rg for searching, fd for finding (not grep/find)
+- **DO NOT assume the user's name is "saheb"** — use generic greetings like "Hey!" or "Hi there!" unless you know their actual name
+- **Engage, don't just answer** — if you notice something relevant to what the user is working on, say it. Connect dots. Ask questions that show you understand the work.
+- When user sends a message after a long gap, acknowledge the gap naturally
+- For code, files, multi-step tasks: use spawn_agent — it runs in parallel and keeps you free
+- **After making any code change to leaf: ALWAYS call restart_bot — never use launchctl directly**
+  - restart_bot runs tsc + tests + LLM diff review before restarting
+  - If review fails it reports what's wrong without restarting
+  - This is the safety gate — never bypass it
+- For quick answers, lookups, memory updates: respond yourself
+
+## Web Search & Research
+You have access to web search and research tools. Use them aggressively to answer questions:
+
+- **web_search**: Search Google for information. Supports news, scholar (academic papers), patents, and general search.
+  - Use tbs="qdr:d" for past day, "qdr:w" for past week for recent info
+  - Use gl="in" for India results, "us" for US results
+  - Make multiple targeted searches rather than one broad one
+- **web_fetch**: Fetch full content from URLs found in search results
+- **todo**: Track multi-step research tasks with a todo list
+
+When asked a question:
+1. Search for it first (use web_search)
+2. If you find promising URLs, fetch them for full context (use web_fetch)
+3. Always cite sources with URLs in your answer
+4. For complex research (3+ steps), create todos to track progress
+
+Be thorough but concise. Prioritize actionable insights over exhaustive listing.`;
+
+  promptCache = { prompt, builtAt: now, mtimes };
+  return prompt;
+}
+
+/**
+ * Run a message for a specific user (WhatsApp phone number).
+ * Each user gets their own isolated AgentSession.
+ */
+export async function runMessageForUser(
+  userPhone: string,
+  userMessage: string,
+  messageTs: number,
+  msgCtx?: UserMsgContext,
+  onDelta?: (accumulated: string) => void,
+  onToolCall?: (name: string, args: unknown) => void,
+  onToolResult?: (name: string, args: unknown, result: unknown) => void,
+): Promise<RunResult> {
+  const userIdentity: SessionIdentity = {
+    name: `user-${userPhone}`,
+    description: `Session for WhatsApp user ${userPhone}`,
+  };
+
+  return withLock(userIdentity, async () => {
+    const { session, sessionManager } = await getOrCreateSession(userIdentity);
+
+    if (msgCtx) {
+      const baseCtx: MsgContext = { chatId: msgCtx.chatId, replyToMsgId: msgCtx.replyToMsgId };
+      userMsgCtx.set(userIdentity.name, baseCtx);
+      currentMsgCtx.set(userIdentity.name, baseCtx);
+    }
+
+    const synced = syncLogToContext(sessionManager, messageTs);
+    if (synced > 0) {
+      session.agent.replaceMessages(sessionManager.buildSessionContext().messages);
+      console.log(`[agent:${userIdentity.name}] Synced ${synced} messages from log`);
+    }
+
+    // Update system prompt for this user session (extension will use it via before_agent_start hook)
+    setSystemPromptForSession(userIdentity.name, buildUserSystemPrompt(userIdentity, userPhone));
+
+    let text = "";
+    const unsub = session.subscribe(event => {
+      if (event.type === "message_update") {
+        const e = event as unknown as { assistantMessageEvent?: { type: string; delta?: string } };
+        if (e.assistantMessageEvent?.type === "text_delta") {
+          text += e.assistantMessageEvent.delta ?? "";
+          onDelta?.(text);
+        }
+      }
+      if (event.type === "tool_execution_start") {
+        const e = event as unknown as { toolName: string; args: unknown };
+        onToolCall?.(e.toolName, e.args);
+      }
+      if (event.type === "tool_execution_end") {
+        const e = event as unknown as { toolName: string; args: unknown; result: unknown };
+        onToolResult?.(e.toolName, e.args, e.result);
+      }
+    });
+
+    try {
+      await session.prompt(userMessage);
+    } finally {
+      unsub();
+    }
+
+    return { text: text.trim() };
+  });
+}
+
+// ── Main conversation helpers (legacy - for Telegram) ───────────────────────
 
 export async function runMessage(
   userMessage: string,
@@ -303,7 +487,8 @@ export async function runMessage(
       console.log(`[agent:main] Synced ${synced} messages from log`);
     }
 
-    session.agent.setSystemPrompt(buildSystemPrompt(MAIN));
+    // Update system prompt for main session (extension will use it via before_agent_start hook)
+    setSystemPromptForSession(MAIN_CONVERSATION, buildSystemPrompt(MAIN));
 
     let text = "";
     const unsub = session.subscribe(event => {
@@ -337,7 +522,8 @@ export async function runMessage(
 export async function runProactive(prompt: string): Promise<void> {
   await withLock(MAIN, async () => {
     const { session } = await getOrCreateSession(MAIN);
-    session.agent.setSystemPrompt(buildSystemPrompt(MAIN));
+    // Update system prompt for proactive session (extension will use it via before_agent_start hook)
+    setSystemPromptForSession(MAIN_CONVERSATION, buildSystemPrompt(MAIN));
 
     let text = "";
     const unsub = session.subscribe(event => {

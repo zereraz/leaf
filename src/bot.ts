@@ -9,14 +9,16 @@
  *  - Track delivery: compare agent output vs what telegram received
  *  - Auto-diagnose mismatches via debug agent
  */
-import { TG } from "./config.js";
 import type { Transport, IncomingMessage } from "./transport.js";
 import { appendLog, seenUpdateIds } from "./store.js";
 import { route } from "./router.js";
-import { runMessage, formatToolCall, formatToolResult } from "./agent.js";
+import { runMessage, runMessageForUser, formatToolCall, formatToolResult } from "./agent.js";
 import { recordDeliveryReport, diagnoseMismatch, setActiveState, type StreamingMeta, type ActiveMessageState } from "./debug-client-agent.js";
 
 // ── Bot ───────────────────────────────────────────────────────────────────
+
+// In-flight message deduplication (prevents race conditions)
+const handlingMessages = new Set<number>();
 
 export function createBot(transport: Transport) {
   const EDIT_INTERVAL_MS = 2500;       // telegram-safe: ~0.4 edits/sec
@@ -24,8 +26,23 @@ export function createBot(transport: Transport) {
   const NEAR_MAX = 3700;
 
   async function handleMessage(msg: IncomingMessage): Promise<void> {
-    // Only owner
-    if (msg.fromId !== TG.ownerChatId && msg.chatId !== TG.ownerChatId) return;
+    // Strong dedup: reject if currently handling this message
+    if (handlingMessages.has(msg.id)) {
+      console.log(`[bot] Already handling msg ${msg.id}, skipping duplicate`);
+      return;
+    }
+    handlingMessages.add(msg.id);
+    setTimeout(() => handlingMessages.delete(msg.id), 5000); // Release after 5s
+    // Only owner - use transport's owner ID (works for Telegram, WhatsApp, etc.)
+    // NOTE: Relaxed for WhatsApp self-testing - allow any WhatsApp user
+    const isWhatsApp = process.env["TRANSPORT"] === "whatsapp";
+    if (!isWhatsApp && msg.fromId !== transport.config.ownerChatId && msg.chatId !== transport.config.ownerChatId) {
+      console.log(`[bot] Ignored message from ${msg.fromId} (expected ${transport.config.ownerChatId})`);
+      return;
+    }
+
+    // For WhatsApp: use phone number as user identifier for per-user sessions
+    const userId = msg.phone || String(msg.fromId);
 
     const { id: userMsgId, chatId, text, timestamp: ts, replyToText } = msg;
 
@@ -169,25 +186,46 @@ export function createBot(transport: Transport) {
     draftTimer = setInterval(() => void flushEdit(), EDIT_INTERVAL_MS);
 
     try {
-      const { text: response } = await runMessage(
-        agentText, ts,
-        { chatId, replyToMsgId: userMsgId },
-        (acc) => {
-          latestContent = acc;
-          debugState.latestContent = acc;
-          debugState.phase = "streaming";
-          // Stop typing when real text arrives
-          if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
-        },
-        (name, args) => { activeTool = formatToolCall(name, args); debugState.activeTool = activeTool; },
-        (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; debugState.activeTool = ""; },
-      );
+      console.log(`[bot] Calling AI with: "${agentText.slice(0, 50)}..."`);
+
+      // Use per-user session for WhatsApp, shared session for Telegram
+      const { text: response } = isWhatsApp
+        ? await runMessageForUser(
+            userId,
+            agentText, ts,
+            { chatId, replyToMsgId: userMsgId, userPhone: userId },
+            (acc) => {
+              latestContent = acc;
+              debugState.latestContent = acc;
+              debugState.phase = "streaming";
+              console.log(`[bot] AI streaming: "${acc.slice(0, 50)}..."`);
+              if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
+            },
+            (name, args) => { activeTool = formatToolCall(name, args); debugState.activeTool = activeTool; },
+            (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; debugState.activeTool = ""; },
+          )
+        : await runMessage(
+            agentText, ts,
+            { chatId, replyToMsgId: userMsgId },
+            (acc) => {
+              latestContent = acc;
+              debugState.latestContent = acc;
+              debugState.phase = "streaming";
+              console.log(`[bot] AI streaming: "${acc.slice(0, 50)}..."`);
+              // Stop typing when real text arrives
+              if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
+            },
+            (name, args) => { activeTool = formatToolCall(name, args); debugState.activeTool = activeTool; },
+            (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; debugState.activeTool = ""; },
+          );
 
       cleanup();
       debugState.phase = "finalizing";
+      console.log(`[bot] AI response: "${response?.slice(0, 50) || "EMPTY"}..." (${response?.length || 0} chars)`);
 
       if (!response) {
-        await ctx.update(activeMsgId!, "\u200b"); // zero-width space
+        console.log("[bot] Empty response, sending fallback");
+        await ctx.finish(activeMsgId!, "No response", { copyable: false });
         await ctx.setStatus(null);
         debugState.phase = "done";
         setActiveState(null);
