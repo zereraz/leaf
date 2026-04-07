@@ -33,6 +33,7 @@ export function createBot(transport: Transport) {
     }
     handlingMessages.add(msg.id);
     setTimeout(() => handlingMessages.delete(msg.id), 5000); // Release after 5s
+
     // Only owner - use transport's owner ID (works for Telegram, WhatsApp, etc.)
     // NOTE: Relaxed for WhatsApp self-testing - allow any WhatsApp user
     const isWhatsApp = process.env["TRANSPORT"] === "whatsapp";

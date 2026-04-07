@@ -203,7 +203,7 @@ const restartBotTool: ToolDefinition = {
 
 import { readContextBrief } from "./context-agent.js";
 
-// ── System prompt — cached, rebuilds only when files change ───────────────
+// ── System prompt — cached per identity, rebuilds only when files change ───
 
 interface PromptCache {
   prompt: string;
@@ -211,7 +211,8 @@ interface PromptCache {
   mtimes: string;
 }
 
-let promptCache: PromptCache | null = null;
+// Per-identity prompt cache to prevent Telegram/WhatsApp prompt mixing
+const promptCaches = new Map<string, PromptCache>();
 const PROMPT_TTL_MS = 60_000; // max 1 min stale
 
 function promptFileMtimes(): string {
@@ -224,9 +225,10 @@ function buildSystemPrompt(identity: SessionIdentity): string {
   const now = Date.now();
   const mtimes = promptFileMtimes();
 
-  // Return cached if files unchanged and within TTL
-  if (promptCache && (now - promptCache.builtAt < PROMPT_TTL_MS) && promptCache.mtimes === mtimes) {
-    return promptCache.prompt;
+  // Per-identity cache lookup
+  const cached = promptCaches.get(identity.name);
+  if (cached && (now - cached.builtAt < PROMPT_TTL_MS) && cached.mtimes === mtimes) {
+    return cached.prompt;
   }
 
   const running = activeSubAgents();
@@ -268,7 +270,7 @@ You have access to web search and research tools. Use them to answer questions:
 - **todo**: Track multi-step research tasks
 When asked a question, search for it first, then cite sources with URLs.`;
 
-  promptCache = { prompt, builtAt: now, mtimes };
+  promptCaches.set(identity.name, { prompt, builtAt: now, mtimes });
   return prompt;
 }
 
@@ -340,9 +342,10 @@ function buildUserSystemPrompt(identity: SessionIdentity, userPhone: string): st
   const now = Date.now();
   const mtimes = promptFileMtimes();
 
-  // Return cached if files unchanged and within TTL
-  if (promptCache && (now - promptCache.builtAt < PROMPT_TTL_MS) && promptCache.mtimes === mtimes) {
-    return promptCache.prompt;
+  // Per-identity cache lookup (prevents mixing with Telegram prompts)
+  const cached = promptCaches.get(identity.name);
+  if (cached && (now - cached.builtAt < PROMPT_TTL_MS) && cached.mtimes === mtimes) {
+    return cached.prompt;
   }
 
   const running = activeSubAgents();
@@ -397,7 +400,7 @@ When asked a question:
 
 Be thorough but concise. Prioritize actionable insights over exhaustive listing.`;
 
-  promptCache = { prompt, builtAt: now, mtimes };
+  promptCaches.set(identity.name, { prompt, builtAt: now, mtimes });
   return prompt;
 }
 

@@ -319,8 +319,15 @@ function computeBackoff(
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function jidToNumber(jid: string): number {
-  const num = jid.split("@")[0]?.replace(/[^0-9]/g, "");
-  return num ? parseInt(num.slice(-10), 10) : 0;
+  // Use full JID string hash to avoid collisions from different countries
+  // e.g., +91-9876543210 and +1-9876543210 won't collide
+  let hash = 0;
+  for (let i = 0; i < jid.length; i++) {
+    const char = jid.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return Math.abs(hash);
 }
 
 function numberToJid(num: number | string): string {
