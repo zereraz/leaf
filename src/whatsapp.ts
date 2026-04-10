@@ -61,6 +61,11 @@ const GROUP_META_TTL_MS = 5 * 60 * 1000;
 // Credential save queue timeout
 const CREDS_SAVE_FLUSH_TIMEOUT_MS = 15_000;
 
+// Outbound throttling: typing indicator + delay to avoid detection
+const TYPING_DURATION_MS = { min: 2000, max: 5000 }; // 2-5s random typing delay
+const GLOBAL_SEND_COOLDOWN_MS = 1000; // Min 1s between sends globally
+const MAX_QUEUE_SIZE_PER_CHAT = 10; // Drop messages if queue gets too backed up
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 interface ReplyContext {
@@ -523,6 +528,152 @@ async function waitForConnection(sock: WASocket): Promise<void> {
   });
 }
 
+// ── Outbound Send Queue (Throttling) ───────────────────────────────────────
+
+interface QueuedSend {
+  chatJid: string;
+  text: string;
+  resolve: (result: SentMessage) => void;
+  reject: (err: unknown) => void;
+}
+
+// Per-chat send queues to serialize outgoing messages
+const sendQueues = new Map<string, QueuedSend[]>();
+let globalLastSendTime = 0;
+let isProcessingQueues = false;
+
+/**
+ * Enqueue a message to be sent with throttling.
+ * Implements:
+ * - Per-chat queue serialization
+ * - Typing indicator before each send
+ * - Randomized delay (2-5s) to mimic human behavior
+ * - Global cooldown between sends (1s)
+ */
+async function enqueueSend(
+  sock: WASocket,
+  chatJid: string,
+  text: string,
+): Promise<SentMessage> {
+  return new Promise((resolve, reject) => {
+    const queue = sendQueues.get(chatJid) ?? [];
+    if (queue.length >= MAX_QUEUE_SIZE_PER_CHAT) {
+      reject(new Error(`Send queue for ${chatJid} is full (${MAX_QUEUE_SIZE_PER_CHAT})`));
+      return;
+    }
+    queue.push({ chatJid, text, resolve, reject });
+    sendQueues.set(chatJid, queue);
+
+    // Start processing if not already running
+    if (!isProcessingQueues) {
+      processSendQueues(sock).catch(console.error);
+    }
+  });
+}
+
+/**
+ * Process all send queues with throttling delays.
+ * Runs until all queues are empty.
+ */
+async function processSendQueues(sock: WASocket): Promise<void> {
+  if (isProcessingQueues) return;
+  isProcessingQueues = true;
+
+  try {
+    while (sendQueues.size > 0) {
+      // Find the queue with oldest pending message
+      let oldest: { chatJid: string; item: QueuedSend; queue: QueuedSend[] } | null = null;
+
+      for (const [chatJid, queue] of sendQueues.entries()) {
+        if (queue.length === 0) {
+          sendQueues.delete(chatJid);
+          continue;
+        }
+        if (!oldest || queue[0]!.chatJid < oldest.chatJid) {
+          oldest = { chatJid, item: queue[0]!, queue };
+        }
+      }
+
+      if (!oldest) break;
+
+      // Remove from queue before processing
+      oldest.queue.shift();
+      if (oldest.queue.length === 0) {
+        sendQueues.delete(oldest.chatJid);
+      }
+
+      try {
+        const result = await throttledSend(sock, oldest.chatJid, oldest.item.text);
+        oldest.item.resolve(result);
+      } catch (err) {
+        oldest.item.reject(err);
+      }
+    }
+  } finally {
+    isProcessingQueues = false;
+  }
+}
+
+/**
+ * Send a single message with typing indicator and randomized delay.
+ * This mimics human typing patterns to avoid detection.
+ */
+async function throttledSend(
+  sock: WASocket,
+  chatJid: string,
+  text: string,
+): Promise<SentMessage> {
+  // Calculate random typing duration based on message length
+  // Longer messages = longer "typing" time (roughly 30-50ms per char)
+  const charDelay = 30 + Math.random() * 20;
+  const calculatedDelay = Math.min(
+    Math.max(text.length * charDelay, TYPING_DURATION_MS.min),
+    TYPING_DURATION_MS.max,
+  );
+  const typingDuration = Math.floor(calculatedDelay);
+
+  // Show typing indicator
+  try {
+    await sock.sendPresenceUpdate("composing", chatJid);
+  } catch (err) {
+    // Non-critical, continue
+  }
+
+  // Wait for typing duration
+  await sleep(typingDuration);
+
+  // Ensure global cooldown is respected
+  const now = Date.now();
+  const timeSinceLastSend = now - globalLastSendTime;
+  if (timeSinceLastSend < GLOBAL_SEND_COOLDOWN_MS) {
+    await sleep(GLOBAL_SEND_COOLDOWN_MS - timeSinceLastSend);
+  }
+
+  // Stop typing and send
+  try {
+    await sock.sendPresenceUpdate("paused", chatJid);
+  } catch {
+    // Non-critical
+  }
+
+  rememberOutboundText(text);
+  const sent = await sock.sendMessage(chatJid, { text });
+  globalLastSendTime = Date.now();
+
+  if (!sent?.key) {
+    throw new Error("Failed to send message");
+  }
+
+  return {
+    id: messageIdToNumber(sent.key),
+    chatId: jidToNumber(chatJid),
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ── WhatsApp Message Context ───────────────────────────────────────────────
 
 class WhatsAppMessageContext implements MessageContext {
@@ -538,14 +689,9 @@ class WhatsAppMessageContext implements MessageContext {
   }
 
   async send(text: string, opts?: SendOptions): Promise<SentMessage> {
-    rememberOutboundText(text);
-    const sent = await this.sock.sendMessage(this.chatJid, { text });
-    if (!sent?.key) throw new Error("Failed to send message");
-    this.lastMessageId = sent.key.id || undefined;
-    return {
-      id: messageIdToNumber(sent.key),
-      chatId: jidToNumber(this.chatJid),
-    };
+    const result = await enqueueSend(this.sock, this.chatJid, text);
+    this.lastMessageId = String(result.id);
+    return result;
   }
 
   private placeholderSent = false;
@@ -574,11 +720,8 @@ class WhatsAppMessageContext implements MessageContext {
     if (text === this.lastSentText && this.lastSentText !== "") {
       return;
     }
-    rememberOutboundText(text);
-    const sent = await this.sock.sendMessage(this.chatJid, { text });
-    if (sent?.key?.id) {
-      this.lastMessageId = sent.key.id;
-    }
+    const result = await enqueueSend(this.sock, this.chatJid, text);
+    this.lastMessageId = String(result.id);
     this.lastSentText = text;
   }
 
@@ -709,17 +852,16 @@ export class WhatsAppTransport implements Transport {
     if (!this.sock) throw new Error("WhatsApp not connected");
     const ownerNumber = this.ownerNumbers[0] ?? "0";
     const ownerJid = numberToJid(ownerNumber);
-    const sent = await this.sock.sendMessage(ownerJid, { text });
-    if (!sent?.key) throw new Error("Failed to notify owner");
+
+    // Use throttled send queue to avoid triggering detection
+    const result = await enqueueSend(this.sock, ownerJid, text);
+
     rememberRecentOutboundMessage({
       accountId: this._accountId,
       remoteJid: ownerJid,
-      messageId: sent.key.id ?? "",
+      messageId: String(result.id),
     });
-    return {
-      id: messageIdToNumber(sent.key),
-      chatId: this.config.ownerChatId,
-    };
+    return result;
   }
 
   async start(onMessage: (msg: TransportMessage) => Promise<void>): Promise<void> {

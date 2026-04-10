@@ -20,6 +20,28 @@ import { recordDeliveryReport, diagnoseMismatch, setActiveState, type StreamingM
 // In-flight message deduplication (prevents race conditions)
 const handlingMessages = new Set<number>();
 
+// Simple rate limiter: messages per user per hour
+const RATE_LIMIT_MSGS_PER_HOUR = 30;
+const userMessageCounts = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(userId: string): boolean {
+  const now = Date.now();
+  const record = userMessageCounts.get(userId);
+
+  if (!record || now > record.resetAt) {
+    // New window
+    userMessageCounts.set(userId, { count: 1, resetAt: now + 60 * 60 * 1000 });
+    return true;
+  }
+
+  if (record.count >= RATE_LIMIT_MSGS_PER_HOUR) {
+    return false; // Rate limited
+  }
+
+  record.count++;
+  return true;
+}
+
 export function createBot(transport: Transport) {
   const EDIT_INTERVAL_MS = 2500;       // telegram-safe: ~0.4 edits/sec
   const MIN_DELTA_CHARS = 600;          // buffer ~15-20 tokens before editing (reduces rate limit hits)
@@ -34,6 +56,17 @@ export function createBot(transport: Transport) {
     handlingMessages.add(msg.id);
     setTimeout(() => handlingMessages.delete(msg.id), 5000); // Release after 5s
 
+    // For WhatsApp: use phone number as user identifier for per-user sessions
+    const userId = msg.phone || String(msg.fromId);
+
+    // Rate limiting check
+    if (!checkRateLimit(userId)) {
+      console.log(`[bot] Rate limit exceeded for ${userId}`);
+      const ctx = transport.contextFor(msg);
+      await ctx.send("⚠️ Rate limit reached. Please try again later.");
+      return;
+    }
+
     // Only owner - use transport's owner ID (works for Telegram, WhatsApp, etc.)
     // NOTE: Relaxed for WhatsApp self-testing - allow any WhatsApp user
     const isWhatsApp = process.env["TRANSPORT"] === "whatsapp";
@@ -41,9 +74,6 @@ export function createBot(transport: Transport) {
       console.log(`[bot] Ignored message from ${msg.fromId} (expected ${transport.config.ownerChatId})`);
       return;
     }
-
-    // For WhatsApp: use phone number as user identifier for per-user sessions
-    const userId = msg.phone || String(msg.fromId);
 
     const { id: userMsgId, chatId, text, timestamp: ts, replyToText } = msg;
 
