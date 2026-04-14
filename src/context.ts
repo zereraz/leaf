@@ -27,7 +27,7 @@ export function syncLogToContext(
     if (entry.role === "bot") continue;
     if (excludeTs !== undefined && entry.ts === excludeTs) continue;
 
-    const label = `[saheb]: ${entry.text}`;
+    const label = `[user]: ${entry.text}`;
     if (known.has(normalizeText(label))) continue;
 
     (sessionManager as unknown as { appendMessage: (m: unknown) => void }).appendMessage({

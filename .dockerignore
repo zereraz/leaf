@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Node modules (installed in container)
+node_modules
+
+# Test files
+test
+*.test.ts
+vitest.config.ts
+
+# Logs
+*.log
+logs
+
+# Local data (mounted as volumes)
+data
+wa-auth
+*.jsonl
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation (not needed for build)
+docs
+*.md
+
+# Environment (mounted separately)
+.env
+.env.local
+.env.*.local
+
+# Docker files themselves
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Misc
+README.md
+CHANGELOG.md
+LICENSE

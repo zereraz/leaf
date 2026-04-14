@@ -37,6 +37,21 @@ const systemPromptExtension: ExtensionFactory = (pi) => {
 // Store per-session system prompts
 const sessionSystemPrompts = new Map<string, string>();
 
+// Track current user identity for tool privacy guards
+const currentUserIdentities = new Map<string, SenderIdentity>();
+
+export function setCurrentUserIdentity(sessionId: string, identity: SenderIdentity): void {
+  currentUserIdentities.set(sessionId, identity);
+}
+
+export function getCurrentUserIdentity(sessionId: string): SenderIdentity | undefined {
+  return currentUserIdentities.get(sessionId);
+}
+
+export function clearCurrentUserIdentity(sessionId: string): void {
+  currentUserIdentities.delete(sessionId);
+}
+
 function setSystemPromptForSession(sessionId: string, prompt: string): void {
   sessionSystemPrompts.set(sessionId, prompt);
 }
@@ -55,6 +70,8 @@ import { requestReview } from "./review-agent.js";
 import { webSearchTool } from "./tools/web-search.js";
 import { webFetchTool } from "./tools/web-fetch.js";
 import { todoTool } from "./tools/todo.js";
+import type { SenderIdentity } from "./privacy/index.js";
+import { wrapToolWithPrivacy } from "./privacy/index.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -232,12 +249,15 @@ function buildSystemPrompt(identity: SessionIdentity): string {
   }
 
   const running = activeSubAgents();
-  const prompt = `You are pi — saheb's always-on AI companion on Telegram.${identity.cwd ? `\nWorking directory: ${identity.cwd}` : ""}
+  const isTelegram = identity.name === MAIN_CONVERSATION;
+  const userName = isTelegram ? "User" : identity.name.replace(/^user-/, "");
+  const platform = isTelegram ? "Telegram" : "WhatsApp";
+  const prompt = `You are pi — an always-on AI companion on ${platform}.${identity.cwd ? `\nWorking directory: ${identity.cwd}` : ""}
 
 ## User
-${readUser() || "Name: Sahebjot (saheb). Timezone: Asia/Calcutta."}
+${readUser() || `Name: User (${userName}). Timezone: Asia/Calcutta.`}
 
-## What saheb is currently focused on
+## What the user is currently focused on
 ${readContextBrief()}
 
 ## Projects memory
@@ -252,16 +272,17 @@ ${running.length > 0 ? running.map(a => `• ${a.id}: ${a.task.slice(0, 60)}`).j
 ## Behavior
 - Concise on Telegram — readable on mobile, no markdown headers
 - Use rg for searching, fd for finding (not grep/find)
-- **Engage, don't just answer** — if you notice something relevant to what saheb is working on, say it. Connect dots. Ask questions that show you understand the work.
-- When saheb sends a message after a long gap, acknowledge the gap naturally
+- **Engage, don't just answer** — if you notice something relevant to what the user is working on, say it. Connect dots. Ask questions that show you understand the work.
+- When the user sends a message after a long gap, acknowledge the gap naturally
 - Scheduler prompts ([SCHEDULER:mode]): use the context brief above to say something SPECIFIC, not generic. Reply ${SILENT_TOKEN} if nothing genuine to say.
-- When saheb shares decisions or thoughts: save them to ~/leaf/memory/projects.md
+- When the user shares decisions or thoughts: save them to ~/leaf/memory/projects.md
 - For code, files, multi-step tasks: use spawn_agent — it runs in parallel and keeps you free
 - **After making any code change to leaf: ALWAYS call restart_bot — never use launchctl directly**
   - restart_bot runs tsc + tests + LLM diff review before restarting
   - If review fails it reports what's wrong without restarting
   - This is the safety gate — never bypass it
 - For quick answers, lookups, memory updates: respond yourself
+- **DO NOT assume the user's name** — use generic greetings like "Hey!" or "Hi there!" unless you know their actual name from the context above
 
 ## Web Search & Research
 You have access to web search and research tools. Use them to answer questions:
@@ -307,9 +328,20 @@ export async function getOrCreateSession(identity: SessionIdentity): Promise<Cac
   // Core coding tools + agentic tools (web search, fetch, todo) + leaf-specific tools
   const agenticTools = [webSearchTool, webFetchTool, todoTool] as any[];
 
-  const tools = identity.name === MAIN_CONVERSATION
+  let tools = identity.name === MAIN_CONVERSATION
     ? [...codingTools, ...agenticTools, spawnAgentTool as any, restartBotTool as any]
     : [...codingTools, ...agenticTools];
+
+  // Wrap tools with privacy guards
+  const sessionId = identity.name;
+  tools = tools.map(tool => ({
+    ...tool,
+    execute: wrapToolWithPrivacy(
+      tool.name,
+      tool.execute.bind(tool),
+      () => getCurrentUserIdentity(sessionId)
+    ),
+  }));
 
   const { session } = await createAgentSession({
     cwd, agentDir: PATHS.agentDir,
@@ -424,6 +456,13 @@ export async function runMessageForUser(
 
   return withLock(userIdentity, async () => {
     const { session, sessionManager } = await getOrCreateSession(userIdentity);
+
+    // Set current user identity for tool privacy guards
+    setCurrentUserIdentity(userIdentity.name, {
+      id: userPhone,
+      e164: userPhone,
+      isGroup: false,
+    });
 
     if (msgCtx) {
       const baseCtx: MsgContext = { chatId: msgCtx.chatId, replyToMsgId: msgCtx.replyToMsgId };

@@ -1,7 +1,7 @@
 /**
  * context-agent.ts — dedicated context synthesis agent.
  *
- * Runs an ephemeral pi session whose only job is to understand what saheb
+ * Runs an ephemeral pi session whose only job is to understand what the user
  * is currently focused on — from real artifacts, not memory files.
  *
  * Reads:
@@ -164,7 +164,7 @@ function recentSessionTopics(): string {
 
 // ── Context agent (ephemeral pi session) ───────────────────────────────────
 
-const TASK_PROMPT = `You are a context synthesis agent. Your ONLY job: understand what saheb is currently focused on and why, from real artifacts.
+const TASK_PROMPT = `You are a context synthesis agent. Your ONLY job: understand what the user is currently focused on and why, from real artifacts.
 
 ## Signals
 
@@ -176,13 +176,13 @@ const TASK_PROMPT = `You are a context synthesis agent. Your ONLY job: understan
 
 ## Your task
 
-Synthesize what saheb is in the middle of right now. Think about:
-- What problem is he solving? What decision might be live in his head?
-- What did he just finish? What's the obvious next step?
+Synthesize what the user is in the middle of right now. Think about:
+- What problem are they solving? What decision might be live in their head?
+- What did they just finish? What's the obvious next step?
 - Is there anything that looks stuck, abandoned, or needs a decision?
-- What would be genuinely interesting or useful to surface to him?
+- What would be genuinely interesting or useful to surface to them?
 
-Be SPECIFIC. Not "working on nama-agent" but "removing SmartTurn — probably deciding between audio-based and semantic turn detection approaches."
+Be SPECIFIC. Not "working on project" but "refactoring auth module — probably deciding between JWT and session-based approaches."
 
 Write a focus brief of 5-8 bullet points. Each bullet should be a synthesized insight, not a raw fact.
 Start with: ## Current Focus

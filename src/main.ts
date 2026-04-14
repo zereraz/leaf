@@ -5,7 +5,7 @@
  * Set TRANSPORT env var: telegram (default) or whatsapp
  */
 import { initStore } from "./store.js";
-import { createBot } from "./bot.js";
+import { createBot, type BotPrivacyConfig } from "./bot.js";
 import { startScheduler, stopScheduler, forceMode } from "./scheduler.js";
 import { TelegramTransport } from "./telegram.js";
 import { WhatsAppTransport, clearWhatsAppAuth } from "./whatsapp.js";
@@ -13,6 +13,9 @@ import { warmupSession } from "./agent.js";
 import { TG, WA } from "./config.js";
 import type { SchedulerMode } from "./config.js";
 import type { Transport } from "./transport.js";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // ── CLI args ────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -57,8 +60,34 @@ if (forceModeArg) {
   process.exit(0);
 }
 
+// ── Load privacy config ────────────────────────────────────────────────────
+async function loadPrivacyConfig(): Promise<BotPrivacyConfig | undefined> {
+  const configPath = resolve(process.cwd(), "privacy.config.ts");
+  const jsPath = resolve(process.cwd(), "privacy.config.js");
+
+  try {
+    if (existsSync(configPath)) {
+      const module = await import(pathToFileURL(configPath).href);
+      console.log("[leaf] Loaded privacy config from privacy.config.ts");
+      return module.privacyConfig ?? module.default;
+    }
+    if (existsSync(jsPath)) {
+      const module = await import(pathToFileURL(jsPath).href);
+      console.log("[leaf] Loaded privacy config from privacy.config.js");
+      return module.privacyConfig ?? module.default;
+    }
+  } catch (err) {
+    console.warn("[leaf] Failed to load privacy config:", (err as Error).message);
+  }
+
+  console.log("[leaf] No privacy.config.ts found - using defaults (open access)");
+  return undefined;
+}
+
+const privacyConfig = await loadPrivacyConfig();
+
 // ── Bot + scheduler ─────────────────────────────────────────────────────────
-const bot = createBot(transport);
+const bot = createBot(transport, privacyConfig);
 
 startScheduler();
 void bot.start();

@@ -1202,6 +1202,11 @@ export class WhatsAppTransport implements Transport {
     const chatId = jidToNumber(sender);
     jidCache.set(chatId, sender);
 
+    // Get sender name from vCard or push name
+    const senderName = msg.pushName
+      || (participantJid ? undefined : undefined)
+      || replyContext?.sender?.label;
+
     const incomingMsg: TransportMessage = {
       id: messageIdToNumber(msg.key),
       chatId,
@@ -1210,6 +1215,9 @@ export class WhatsAppTransport implements Transport {
       timestamp,
       replyToText: replyContext?.body ?? getReplyText(msg),
       phone: senderE164 ?? undefined,
+      senderName,
+      isGroup,
+      groupId: isGroup ? sender : undefined,
     };
 
     console.log(`[whatsapp] Message from ${sender}: "${incomingMsg.text.slice(0, 50)}..."`);

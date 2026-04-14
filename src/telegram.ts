@@ -24,6 +24,7 @@ export interface TgMessage {
 export interface TgUser {
   readonly id: number;
   readonly first_name?: string;
+  readonly last_name?: string;
   readonly username?: string;
 }
 
@@ -364,6 +365,9 @@ export class TelegramTransport implements Transport {
           if (!msg?.text) continue;
           if (msg.chat.id !== this.config.ownerChatId) continue;
 
+          const chatType = msg.chat.type;
+          const isGroup = chatType === "group" || chatType === "supergroup";
+
           await onMessage({
             id: msg.message_id,
             chatId: msg.chat.id,
@@ -371,6 +375,12 @@ export class TelegramTransport implements Transport {
             fromId: msg.from?.id ?? 0,
             timestamp: msg.date * 1000,
             replyToText: msg.reply_to_message?.text?.trim(),
+            senderName: msg.from?.first_name
+              ? `${msg.from.first_name}${msg.from.last_name ? ` ${msg.from.last_name}` : ""}`
+              : msg.from?.username,
+            username: msg.from?.username,
+            isGroup,
+            groupId: isGroup ? String(msg.chat.id) : undefined,
           });
         }
       } catch (err) {

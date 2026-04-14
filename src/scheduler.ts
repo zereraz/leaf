@@ -76,15 +76,15 @@ function promptFor(mode: SchedulerMode): string {
 
   switch (mode) {
     case "morning_brief":
-      return `[SCHEDULER:morning_brief] Morning brief for saheb.
+      return `[SCHEDULER:morning_brief] Morning brief for the user.
 
-## What he's been working on
+## What they've been working on
 ${context}
 
 Pick the ONE thing with most momentum right now. Say what it is, why it matters today, one concrete next step. 3 lines max. Plain text. ${SILENT_TOKEN} if nothing genuine.`;
 
     case "pulse":
-      return `[SCHEDULER:pulse] Check in on what saheb is currently building.
+      return `[SCHEDULER:pulse] Check in on what the user is currently building.
 
 ## Current focus synthesis
 ${context}
@@ -100,7 +100,7 @@ ${context}
 Reflect on what was built or decided today. Something specific worth capturing, or a question about tomorrow. 2 lines. ${SILENT_TOKEN} if nothing.`;
 
     case "stale_review":
-      return `[SCHEDULER:stale_review] Weekly: anything gone cold that saheb probably intended to continue?
+      return `[SCHEDULER:stale_review] Weekly: anything gone cold that the user probably intended to continue?
 
 ## Current focus (what's active)
 ${context}
@@ -124,7 +124,7 @@ async function tick(): Promise<void> {
   console.log(`[scheduler] Running: ${mode}`);
 
   // Refresh context brief before crafting proactive message
-  // so the main agent has real synthesis of what saheb is doing
+  // so the main agent has real synthesis of what the user is doing
   await gatherContext().catch(err => console.warn("[scheduler] context gather failed:", err));
 
   try {

@@ -1,8 +1,9 @@
 /**
- * bot.ts — transport-agnostic message handling.
+ * bot.ts — transport-agnostic message handling with privacy controls.
  *
  * Responsibilities:
  *  - Dedup by update_id (persisted in log)
+ *  - Privacy: group access control, mention requirements, tool scoping
  *  - Route commands (instant reply) vs messages (agent)
  *  - Streaming: placeholder → edit every 2s with 300-char buffer → finish with copy button
  *  - setStatus ⌛/✅/⚠️ via MessageContext
@@ -14,8 +15,41 @@ import { appendLog, seenUpdateIds } from "./store.js";
 import { route } from "./router.js";
 import { runMessage, runMessageForUser, formatToolCall, formatToolResult } from "./agent.js";
 import { recordDeliveryReport, diagnoseMismatch, setActiveState, type StreamingMeta, type ActiveMessageState } from "./debug-client-agent.js";
+import {
+  type SenderIdentity,
+  type GroupAccessConfig,
+  type ToolScopeConfig,
+  buildSenderIdentity,
+  getPrimaryIdentifier,
+  evaluateGroupAccess,
+  shouldRespondToMention,
+  stripMention,
+  DEFAULT_GROUP_CONFIG,
+  DEFAULT_TOOL_SCOPE_CONFIG,
+  isToolAllowed,
+} from "./privacy/index.js";
 
-// ── Bot ───────────────────────────────────────────────────────────────────
+// ── Bot Configuration ─────────────────────────────────────────────────────
+
+export interface BotPrivacyConfig {
+  /** Group access configuration */
+  groupAccess: GroupAccessConfig;
+  /** Tool scoping configuration */
+  toolScope: ToolScopeConfig;
+  /** Owner identifiers (bypass all restrictions) */
+  ownerIds: string[];
+  /** Whether to enforce strict privacy (deny by default) */
+  strictMode: boolean;
+}
+
+export const DEFAULT_PRIVACY_CONFIG: BotPrivacyConfig = {
+  groupAccess: DEFAULT_GROUP_CONFIG,
+  toolScope: DEFAULT_TOOL_SCOPE_CONFIG,
+  ownerIds: [],
+  strictMode: false,
+};
+
+// ── Bot State ─────────────────────────────────────────────────────────────
 
 // In-flight message deduplication (prevents race conditions)
 const handlingMessages = new Set<number>();
@@ -42,10 +76,60 @@ function checkRateLimit(userId: string): boolean {
   return true;
 }
 
-export function createBot(transport: Transport) {
-  const EDIT_INTERVAL_MS = 2500;       // telegram-safe: ~0.4 edits/sec
-  const MIN_DELTA_CHARS = 600;          // buffer ~15-20 tokens before editing (reduces rate limit hits)
+// ── Privacy Utilities ─────────────────────────────────────────────────────
+
+/**
+ * Build SenderIdentity from incoming message.
+ */
+function buildIdentity(msg: IncomingMessage): SenderIdentity {
+  const params: Parameters<typeof buildSenderIdentity>[0] = {
+    id: String(msg.fromId),
+    isGroup: msg.isGroup,
+  };
+  if (msg.phone !== undefined) params.e164 = msg.phone;
+  if (msg.username !== undefined) params.username = msg.username;
+  if (msg.senderName !== undefined) params.name = msg.senderName;
+  if (msg.groupId !== undefined) params.groupId = msg.groupId;
+  return buildSenderIdentity(params);
+}
+
+/**
+ * Check if user is an owner (bypasses restrictions).
+ * Returns false since owner feature is disabled.
+ */
+function isOwner(_identity: SenderIdentity, config: BotPrivacyConfig): boolean {
+  return config.ownerIds.length > 0 && config.ownerIds[0] !== "";
+}
+
+/**
+ * Filter tools based on sender scope.
+ */
+function filterToolsForSender(
+  identity: SenderIdentity,
+  config: ToolScopeConfig,
+): string[] {
+  // Get all available tool names from agent
+  const allTools = ["bash", "read", "edit", "write", "spawn_agent", "web_search", "todo"];
+
+  return allTools.filter(tool => isToolAllowed(identity, tool, config));
+}
+
+// ── Bot Factory ────────────────────────────────────────────────────────────
+
+export function createBot(
+  transport: Transport,
+  privacyConfig: Partial<BotPrivacyConfig> = {},
+) {
+  const EDIT_INTERVAL_MS = 2500;
+  const MIN_DELTA_CHARS = 600;
   const NEAR_MAX = 3700;
+
+  const config: BotPrivacyConfig = {
+    ...DEFAULT_PRIVACY_CONFIG,
+    ...privacyConfig,
+    groupAccess: { ...DEFAULT_GROUP_CONFIG, ...privacyConfig.groupAccess },
+    toolScope: { ...DEFAULT_TOOL_SCOPE_CONFIG, ...privacyConfig.toolScope },
+  };
 
   async function handleMessage(msg: IncomingMessage): Promise<void> {
     // Strong dedup: reject if currently handling this message
@@ -54,10 +138,14 @@ export function createBot(transport: Transport) {
       return;
     }
     handlingMessages.add(msg.id);
-    setTimeout(() => handlingMessages.delete(msg.id), 5000); // Release after 5s
+    setTimeout(() => handlingMessages.delete(msg.id), 5000);
 
-    // For WhatsApp: use phone number as user identifier for per-user sessions
+    // Build sender identity
+    const identity = buildIdentity(msg);
     const userId = msg.phone || String(msg.fromId);
+    const primaryId = getPrimaryIdentifier(identity);
+
+    console.log(`[bot] Message from ${primaryId} (group: ${msg.isGroup})`);
 
     // Rate limiting check
     if (!checkRateLimit(userId)) {
@@ -67,23 +155,52 @@ export function createBot(transport: Transport) {
       return;
     }
 
-    // Only owner - use transport's owner ID (works for Telegram, WhatsApp, etc.)
-    // NOTE: Relaxed for WhatsApp self-testing - allow any WhatsApp user
+    // Owner bypass - allow owners even if not in allowlist
+    const userIsOwner = isOwner(identity, config);
+
+    // Only owner check for non-WhatsApp (Telegram mode)
     const isWhatsApp = process.env["TRANSPORT"] === "whatsapp";
-    if (!isWhatsApp && msg.fromId !== transport.config.ownerChatId && msg.chatId !== transport.config.ownerChatId) {
-      console.log(`[bot] Ignored message from ${msg.fromId} (expected ${transport.config.ownerChatId})`);
-      return;
+    if (!isWhatsApp && !userIsOwner) {
+      if (msg.fromId !== transport.config.ownerChatId && msg.chatId !== transport.config.ownerChatId) {
+        console.log(`[bot] Ignored message from ${msg.fromId} (expected ${transport.config.ownerChatId})`);
+        return;
+      }
     }
 
-    const { id: userMsgId, chatId, text, timestamp: ts, replyToText } = msg;
+    // ── Group Privacy Controls ─────────────────────────────────────────
 
-    // If replying to a message, prepend context so the agent sees it
+    // Group access check
+    if (msg.isGroup) {
+      const accessDecision = evaluateGroupAccess(identity, config.groupAccess);
+
+      if (!accessDecision.allowed && !userIsOwner) {
+        console.log(`[bot] Group access denied for ${primaryId}: ${accessDecision.reason}`);
+        // Silently drop the message (don't leak bot presence)
+        return;
+      }
+
+      // Mention check for groups
+      if (!shouldRespondToMention(msg.text, true, config.groupAccess) && !userIsOwner) {
+        console.log(`[bot] Message ignored - mention required in groups`);
+        return;
+      }
+    }
+
+    // Prepare message text (strip mention if present)
+    let text = msg.text;
+    if (msg.isGroup && config.groupAccess.botUsername) {
+      text = stripMention(msg.text, config.groupAccess.botUsername);
+    }
+
+    const { id: userMsgId, chatId, timestamp: ts, replyToText } = msg;
+
+    // If replying to a message, prepend context
     const agentText = replyToText
       ? `[replying to: "${replyToText.slice(0, 500)}"]\n${text}`
       : text;
 
     // Route — commands get instant reply, no agent
-    const routed = route(text);  // route on raw text (commands don't need reply context)
+    const routed = route(text);
     const ctx = transport.contextFor(msg);
 
     if (routed.kind === "command_reply") {
@@ -99,6 +216,10 @@ export function createBot(transport: Transport) {
 
     // Persist immediately — dedup source
     await appendLog({ date: new Date(ts).toISOString(), ts, role: "user", text: agentText, updateId: userMsgId, messageId: userMsgId });
+
+    // ── Tool Scope Check ───────────────────────────────────────────────
+    const allowedTools = filterToolsForSender(identity, config.toolScope);
+    console.log(`[bot] Allowed tools for ${primaryId}: ${allowedTools.join(", ") || "none"}`);
 
     // ── Streaming state ────────────────────────────────────────────────
     let activeMsgId: number | null = null;
@@ -135,12 +256,10 @@ export function createBot(transport: Transport) {
     setActiveState(debugState);
 
     const buildDisplay = (): string => {
-      // During text generation: show text + current tool at the bottom
       if (latestContent.length > 0) {
         if (activeTool) return `${latestContent}\n\n${activeTool}`;
         return latestContent;
       }
-      // Before text: show last few completed tools + current active tool
       const recent = toolLog.slice(-3);
       if (activeTool) recent.push(activeTool);
       return recent.join("\n") || "";
@@ -174,14 +293,12 @@ export function createBot(transport: Transport) {
       if (!display) return;
       if (!hasText) {
         showingToolStatus = true;
-        // Tool status changed — stop typing, show status
         if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
       }
 
       const chunk = display.slice(committedChars);
       if (!chunk || chunk === lastEditedText) return;
 
-      // Buffer small deltas — don't hit telegram for tiny changes
       const delta = chunk.length - lastEditedText.length;
       if (delta > 0 && delta < MIN_DELTA_CHARS && chunk.length < NEAR_MAX) return;
 
@@ -232,8 +349,21 @@ export function createBot(transport: Transport) {
               console.log(`[bot] AI streaming: "${acc.slice(0, 50)}..."`);
               if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
             },
-            (name, args) => { activeTool = formatToolCall(name, args); debugState.activeTool = activeTool; },
-            (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; debugState.activeTool = ""; },
+            (name, args) => {
+              // Check if tool is allowed
+              if (!isToolAllowed(identity, name, config.toolScope) && !userIsOwner) {
+                activeTool = `⛔ ${name}: not allowed`;
+                debugState.activeTool = activeTool;
+                return;
+              }
+              activeTool = formatToolCall(name, args);
+              debugState.activeTool = activeTool;
+            },
+            (name, args, result) => {
+              toolLog.push(formatToolResult(name, args, result));
+              activeTool = "";
+              debugState.activeTool = "";
+            },
           )
         : await runMessage(
             agentText, ts,
@@ -243,7 +373,6 @@ export function createBot(transport: Transport) {
               debugState.latestContent = acc;
               debugState.phase = "streaming";
               console.log(`[bot] AI streaming: "${acc.slice(0, 50)}..."`);
-              // Stop typing when real text arrives
               if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
             },
             (name, args) => { activeTool = formatToolCall(name, args); debugState.activeTool = activeTool; },
