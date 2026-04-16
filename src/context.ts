@@ -13,9 +13,15 @@ interface SessionEntry {
   message?: AgentMessage & { role: string; content: unknown };
 }
 
+export interface SyncOptions {
+  excludeTs?: number;
+  isGroup?: boolean;
+  senderPhone?: string;
+}
+
 export function syncLogToContext(
   sessionManager: SessionManager,
-  excludeTs?: number,
+  options?: SyncOptions,
 ): number {
   const entries = readLog();
   if (entries.length === 0) return 0;
@@ -23,11 +29,21 @@ export function syncLogToContext(
   const known = buildKnownSet(sessionManager);
   let synced = 0;
 
+  const excludeTs = options?.excludeTs;
+  const isGroup = options?.isGroup;
+  const senderPhone = options?.senderPhone;
+
   for (const entry of entries) {
     if (entry.role === "bot") continue;
     if (excludeTs !== undefined && entry.ts === excludeTs) continue;
 
-    const label = `[user]: ${entry.text}`;
+    // Label messages with sender in group contexts
+    const label = isGroup && senderPhone
+      ? `[${senderPhone}]: ${entry.text}`
+      : isGroup
+        ? `[user]: ${entry.text}`
+        : `[user]: ${entry.text}`;
+
     if (known.has(normalizeText(label))) continue;
 
     (sessionManager as unknown as { appendMessage: (m: unknown) => void }).appendMessage({

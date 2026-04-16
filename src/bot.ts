@@ -13,7 +13,7 @@
 import type { Transport, IncomingMessage } from "./transport.js";
 import { appendLog, seenUpdateIds } from "./store.js";
 import { route } from "./router.js";
-import { runMessage, runMessageForUser, formatToolCall, formatToolResult } from "./agent.js";
+import { runMessage, runMessageForUser, runMessageForGroup, formatToolCall, formatToolResult } from "./agent.js";
 import { recordDeliveryReport, diagnoseMismatch, setActiveState, type StreamingMeta, type ActiveMessageState } from "./debug-client-agent.js";
 import {
   type SenderIdentity,
@@ -28,6 +28,7 @@ import {
   DEFAULT_TOOL_SCOPE_CONFIG,
   isToolAllowed,
 } from "./privacy/index.js";
+import { getConsentManager, formatConsentRequest } from "./privacy/consent.js";
 
 // ── Bot Configuration ─────────────────────────────────────────────────────
 
@@ -112,6 +113,37 @@ function filterToolsForSender(
   const allTools = ["bash", "read", "edit", "write", "spawn_agent", "web_search", "todo"];
 
   return allTools.filter(tool => isToolAllowed(identity, tool, config));
+}
+
+/**
+ * Handle consent approval/denial from user.
+ */
+async function handleConsentResponse(
+  identity: SenderIdentity,
+  requestId: string,
+  approved: boolean,
+  ctx: ReturnType<Transport["contextFor"]>,
+  replyToId: number,
+): Promise<void> {
+  try {
+    const manager = getConsentManager();
+    const request = manager.getRequest(requestId);
+
+    if (!request) {
+      await ctx.send(`❌ Consent request ${requestId} not found.`, { replyToId });
+      return;
+    }
+
+    const result = await manager.respond(identity, requestId, approved);
+    const status = result.status === "approved" ? "✅ Approved" : "❌ Denied";
+    await ctx.send(`${status} access to your ${result.dataDescription}`, { replyToId });
+
+    // Notify requester of the outcome
+    console.log(`[consent] Notifying requester ${result.requesterId} of ${result.status} for ${requestId}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await ctx.send(`⚠️ ${msg}`, { replyToId });
+  }
 }
 
 // ── Bot Factory ────────────────────────────────────────────────────────────
@@ -202,6 +234,23 @@ export function createBot(
     // Route — commands get instant reply, no agent
     const routed = route(text);
     const ctx = transport.contextFor(msg);
+
+    // Handle consent commands with identity context
+    const trimmedText = text.trim();
+    if (trimmedText.startsWith("/approve ") || trimmedText.startsWith("approve ")) {
+      const requestId = trimmedText.split(/\s+/)[1];
+      if (requestId) {
+        await handleConsentResponse(identity, requestId, true, ctx, userMsgId);
+        return;
+      }
+    }
+    if (trimmedText.startsWith("/deny ") || trimmedText.startsWith("deny ")) {
+      const requestId = trimmedText.split(/\s+/)[1];
+      if (requestId) {
+        await handleConsentResponse(identity, requestId, false, ctx, userMsgId);
+        return;
+      }
+    }
 
     if (routed.kind === "command_reply") {
       await ctx.send(routed.text, { replyToId: userMsgId });
@@ -336,12 +385,16 @@ export function createBot(
     try {
       console.log(`[bot] Calling AI with: "${agentText.slice(0, 50)}..."`);
 
-      // Use per-user session for WhatsApp, shared session for Telegram
-      const { text: response } = isWhatsApp
-        ? await runMessageForUser(
+      // Route to appropriate session handler:
+      // - Group messages: shared group session
+      // - WhatsApp DMs: per-user session
+      // - Telegram DMs: legacy shared session
+      const { text: response } = msg.isGroup
+        ? await runMessageForGroup(
+            msg.groupId!,
             userId,
             agentText, ts,
-            { chatId, replyToMsgId: userMsgId, userPhone: userId },
+            { chatId, replyToMsgId: userMsgId, groupId: msg.groupId!, senderPhone: userId },
             (acc) => {
               latestContent = acc;
               debugState.latestContent = acc;
@@ -365,19 +418,47 @@ export function createBot(
               debugState.activeTool = "";
             },
           )
-        : await runMessage(
-            agentText, ts,
-            { chatId, replyToMsgId: userMsgId },
-            (acc) => {
-              latestContent = acc;
-              debugState.latestContent = acc;
-              debugState.phase = "streaming";
-              console.log(`[bot] AI streaming: "${acc.slice(0, 50)}..."`);
-              if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
-            },
-            (name, args) => { activeTool = formatToolCall(name, args); debugState.activeTool = activeTool; },
-            (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; debugState.activeTool = ""; },
-          );
+        : isWhatsApp
+          ? await runMessageForUser(
+              userId,
+              agentText, ts,
+              { chatId, replyToMsgId: userMsgId, userPhone: userId },
+              (acc) => {
+                latestContent = acc;
+                debugState.latestContent = acc;
+                debugState.phase = "streaming";
+                console.log(`[bot] AI streaming: "${acc.slice(0, 50)}..."`);
+                if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
+              },
+              (name, args) => {
+                // Check if tool is allowed
+                if (!isToolAllowed(identity, name, config.toolScope) && !userIsOwner) {
+                  activeTool = `⛔ ${name}: not allowed`;
+                  debugState.activeTool = activeTool;
+                  return;
+                }
+                activeTool = formatToolCall(name, args);
+                debugState.activeTool = activeTool;
+              },
+              (name, args, result) => {
+                toolLog.push(formatToolResult(name, args, result));
+                activeTool = "";
+                debugState.activeTool = "";
+              },
+            )
+          : await runMessage(
+              agentText, ts,
+              { chatId, replyToMsgId: userMsgId },
+              (acc) => {
+                latestContent = acc;
+                debugState.latestContent = acc;
+                debugState.phase = "streaming";
+                console.log(`[bot] AI streaming: "${acc.slice(0, 50)}..."`);
+                if (typingTimer) { clearInterval(typingTimer); typingTimer = null; debugState.isTyping = false; }
+              },
+              (name, args) => { activeTool = formatToolCall(name, args); debugState.activeTool = activeTool; },
+              (name, args, result) => { toolLog.push(formatToolResult(name, args, result)); activeTool = ""; debugState.activeTool = ""; },
+            );
 
       cleanup();
       debugState.phase = "finalizing";

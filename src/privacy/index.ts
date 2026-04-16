@@ -62,6 +62,7 @@ export {
   fileAccessGuard,
   bashGuard,
   spawnAgentGuard,
+  mcpToolGuard,
   registerToolGuard,
   getToolGuard,
   wrapToolWithPrivacy,
@@ -69,3 +70,26 @@ export {
   getAuditLog,
   clearAuditLog,
 } from "./tool-wrapper.js";
+
+// Consent
+export {
+  type ConsentStatus,
+  type ConsentRequest,
+  type ConsentConfig,
+  ConsentError,
+  getConsentManager,
+  requestDataAccessConsent,
+  isDataAccessConsented,
+  formatConsentRequest,
+} from "./consent.js";
+
+// MCP Wrapper
+export {
+  type McpTool,
+  type McpToolResult,
+  type McpWrapperOptions,
+  wrapMcpTool,
+  wrapMcpTools,
+  extractDataOwner,
+  withPrivacySchema,
+} from "./mcp-wrapper.js";

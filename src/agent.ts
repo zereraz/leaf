@@ -40,16 +40,39 @@ const sessionSystemPrompts = new Map<string, string>();
 // Track current user identity for tool privacy guards
 const currentUserIdentities = new Map<string, SenderIdentity>();
 
-export function setCurrentUserIdentity(sessionId: string, identity: SenderIdentity): void {
+// Track original sender in group contexts (for data access control)
+const originalSenders = new Map<string, string>();
+
+export function setCurrentUserIdentity(sessionId: string, identity: SenderIdentity, originalSender?: string): void {
   currentUserIdentities.set(sessionId, identity);
+  if (originalSender) {
+    originalSenders.set(sessionId, originalSender);
+  }
 }
 
 export function getCurrentUserIdentity(sessionId: string): SenderIdentity | undefined {
-  return currentUserIdentities.get(sessionId);
+  const identity = currentUserIdentities.get(sessionId);
+  if (!identity) return undefined;
+
+  // In group contexts, return identity with original sender for data access
+  const originalSender = originalSenders.get(sessionId);
+  if (originalSender && identity.isGroup) {
+    return {
+      ...identity,
+      id: originalSender,
+      e164: originalSender.startsWith("1") || originalSender.startsWith("9") ? originalSender : identity.e164,
+    };
+  }
+  return identity;
+}
+
+export function getOriginalSender(sessionId: string): string | undefined {
+  return originalSenders.get(sessionId);
 }
 
 export function clearCurrentUserIdentity(sessionId: string): void {
   currentUserIdentities.delete(sessionId);
+  originalSenders.delete(sessionId);
 }
 
 function setSystemPromptForSession(sessionId: string, prompt: string): void {
@@ -470,7 +493,7 @@ export async function runMessageForUser(
       currentMsgCtx.set(userIdentity.name, baseCtx);
     }
 
-    const synced = syncLogToContext(sessionManager, messageTs);
+    const synced = syncLogToContext(sessionManager, { excludeTs: messageTs });
     if (synced > 0) {
       session.agent.replaceMessages(sessionManager.buildSessionContext().messages);
       console.log(`[agent:${userIdentity.name}] Synced ${synced} messages from log`);
@@ -508,6 +531,143 @@ export async function runMessageForUser(
   });
 }
 
+// ── Group session helpers ───────────────────────────────────────────────────
+
+interface GroupMsgContext { chatId: number; replyToMsgId: number; groupId: string; senderPhone: string }
+const groupMsgCtx = new Map<string, MsgContext>();
+
+/**
+ * Build a group-specific system prompt.
+ */
+function buildGroupSystemPrompt(identity: SessionIdentity, groupId: string, senderPhone: string): string {
+  const now = Date.now();
+  const mtimes = promptFileMtimes();
+
+  // Per-identity cache lookup
+  const cached = promptCaches.get(identity.name);
+  if (cached && (now - cached.builtAt < PROMPT_TTL_MS) && cached.mtimes === mtimes) {
+    return cached.prompt;
+  }
+
+  const running = activeSubAgents();
+  const prompt = `You are pi — an always-on AI assistant in a group chat.${identity.cwd ? `\nWorking directory: ${identity.cwd}` : ""}
+
+## Current User
+Phone: ${senderPhone}
+Group ID: ${groupId}
+${readUser() || "Timezone: Asia/Calcutta."}
+
+## Group Context
+This is a group conversation. Multiple users are participating. Each message is labeled with the sender's identifier.
+
+## What the group is currently focused on
+${readContextBrief()}
+
+## Projects memory
+${readProjects()}
+
+## Long-term memory
+${readMemory()}
+
+## Active sub-agents
+${running.length > 0 ? running.map(a => `• ${a.id}: ${a.task.slice(0, 60)}`).join("\n") : "none"}
+
+## Behavior
+- Concise and helpful — readable on mobile, no markdown headers
+- Use rg for searching, fd for finding (not grep/find)
+- **Respect user data boundaries** — don't share one user's private data with another
+- When a user sends a message after a long gap, acknowledge the gap naturally
+- **DO NOT assume the user's name** — use generic greetings or their identifier unless you know their actual name
+- For code, files, multi-step tasks: use spawn_agent — it runs in parallel and keeps you free
+- **After making any code change to leaf: ALWAYS call restart_bot — never use launchctl directly**
+  - restart_bot runs tsc + tests + LLM diff review before restarting
+- For quick answers, lookups, memory updates: respond yourself
+
+## Web Search & Research
+You have access to web search and research tools. Use them aggressively to answer questions:
+- **web_search**: Search Google for information (news, scholar, patents, general)
+- **web_fetch**: Fetch full content from URLs found in search results
+- **todo**: Track multi-step research tasks
+When asked a question, search for it first, then cite sources with URLs.`;
+
+  promptCaches.set(identity.name, { prompt, builtAt: now, mtimes });
+  return prompt;
+}
+
+/**
+ * Run a message for a group (shared session with sender tracking).
+ * All users in the group share the same session, but sender identity is tracked for data access.
+ */
+export async function runMessageForGroup(
+  groupId: string,
+  senderPhone: string,
+  message: string,
+  messageTs: number,
+  msgCtx?: GroupMsgContext,
+  onDelta?: (accumulated: string) => void,
+  onToolCall?: (name: string, args: unknown) => void,
+  onToolResult?: (name: string, args: unknown, result: unknown) => void,
+): Promise<RunResult> {
+  const groupIdentity: SessionIdentity = {
+    name: `group-${groupId}`,
+    description: `Group session for ${groupId}`,
+  };
+
+  return withLock(groupIdentity, async () => {
+    const { session, sessionManager } = await getOrCreateSession(groupIdentity);
+
+    // Set current user identity WITH original sender for data access control
+    setCurrentUserIdentity(groupIdentity.name, {
+      id: groupId,
+      e164: senderPhone,
+      isGroup: true,
+      groupId,
+    }, senderPhone); // Track original sender separately
+
+    if (msgCtx) {
+      const baseCtx: MsgContext = { chatId: msgCtx.chatId, replyToMsgId: msgCtx.replyToMsgId };
+      groupMsgCtx.set(groupIdentity.name, baseCtx);
+      currentMsgCtx.set(groupIdentity.name, baseCtx);
+    }
+
+    const synced = syncLogToContext(sessionManager, { excludeTs: messageTs, isGroup: true, senderPhone });
+    if (synced > 0) {
+      session.agent.replaceMessages(sessionManager.buildSessionContext().messages);
+      console.log(`[agent:${groupIdentity.name}] Synced ${synced} messages from log`);
+    }
+
+    // Update system prompt for this group session
+    setSystemPromptForSession(groupIdentity.name, buildGroupSystemPrompt(groupIdentity, groupId, senderPhone));
+
+    let text = "";
+    const unsub = session.subscribe(event => {
+      if (event.type === "message_update") {
+        const e = event as unknown as { assistantMessageEvent?: { type: string; delta?: string } };
+        if (e.assistantMessageEvent?.type === "text_delta") {
+          text += e.assistantMessageEvent.delta ?? "";
+          onDelta?.(text);
+        }
+      }
+      if (event.type === "tool_execution_start") {
+        const e = event as unknown as { toolName: string; args: unknown };
+        onToolCall?.(e.toolName, e.args);
+      }
+      if (event.type === "tool_execution_end") {
+        const e = event as unknown as { toolName: string; args: unknown; result: unknown };
+        onToolResult?.(e.toolName, e.args, e.result);
+      }
+    });
+
+    try {
+      await session.prompt(message);
+    } finally {
+      unsub();
+    }
+
+    return { text: text.trim() };
+  });
+}
+
 // ── Main conversation helpers (legacy - for Telegram) ───────────────────────
 
 export async function runMessage(
@@ -523,7 +683,7 @@ export async function runMessage(
 
     if (msgCtx) currentMsgCtx.set(MAIN_CONVERSATION, msgCtx);
 
-    const synced = syncLogToContext(sessionManager, messageTs);
+    const synced = syncLogToContext(sessionManager, { excludeTs: messageTs });
     if (synced > 0) {
       session.agent.replaceMessages(sessionManager.buildSessionContext().messages);
       console.log(`[agent:main] Synced ${synced} messages from log`);
