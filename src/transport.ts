@@ -22,6 +22,11 @@ export interface IncomingMessage {
   readonly fromId: number;   // sender platform ID
   readonly timestamp: number; // unix ms
   readonly replyToText?: string | undefined;  // text of the message being replied to (if any)
+  readonly phone?: string | undefined;   // sender phone number (E.164 format, WhatsApp only)
+  readonly senderName?: string | undefined;  // sender display name
+  readonly username?: string | undefined;    // sender username/handle
+  readonly isGroup: boolean;                 // whether this is a group message
+  readonly groupId?: string | undefined;     // group identifier (if isGroup)
 }
 
 // ── Response context (per message) ───────────────────────────────────────

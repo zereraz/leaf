@@ -13,6 +13,8 @@ import { evictSession } from "./agent.js";
 import { activeSubAgents } from "./subagent.js";
 import { readLog } from "./store.js";
 import { getDebugSnapshot, formatDebugSnapshot } from "./debug-client-agent.js";
+import { getConsentManager, formatConsentRequest } from "./privacy/consent.js";
+import type { SenderIdentity } from "./privacy/index.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -34,11 +36,13 @@ function handleCommand(text: string): RouteResult {
   const args = rest.join(" ").trim();
 
   switch (cmd?.toLowerCase()) {
-    case "/help":   return { kind: "command_reply", text: helpText() };
-    case "/status": return cmdStatus();
-    case "/reset":  return cmdReset();
-    case "/agents": return cmdAgents();
-    case "/debug":  return cmdDebug(args);
+    case "/help":    return { kind: "command_reply", text: helpText() };
+    case "/status":  return cmdStatus();
+    case "/reset":   return cmdReset();
+    case "/agents":  return cmdAgents();
+    case "/debug":   return cmdDebug(args);
+    case "/approve": return cmdApprove(args);
+    case "/deny":    return cmdDeny(args);
     default:
       return { kind: "command_reply", text: `Unknown: ${cmd}\n\n${helpText()}` };
   }
@@ -76,6 +80,23 @@ function cmdDebug(args: string): RouteResult {
   return { kind: "command_reply", text: formatDebugSnapshot(snap) };
 }
 
+// Stub identity for consent commands - actual identity resolved in bot.ts
+function cmdApprove(args: string): RouteResult {
+  if (!args.trim()) {
+    return { kind: "command_reply", text: "Usage: /approve <request-id>" };
+  }
+  // Actual approval handled in bot.ts with proper identity context
+  return { kind: "command_reply", text: "Processing approval..." };
+}
+
+function cmdDeny(args: string): RouteResult {
+  if (!args.trim()) {
+    return { kind: "command_reply", text: "Usage: /deny <request-id>" };
+  }
+  // Actual denial handled in bot.ts with proper identity context
+  return { kind: "command_reply", text: "Processing denial..." };
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function formatUptime(seconds: number): string {
@@ -94,5 +115,9 @@ function helpText(): string {
     "/agents  — list active sub-agents",
     "/debug [n] — diagnose delivery: active state, last n messages, mismatches (default 3, max 10)",
     "/help    — this",
+    "",
+    "Consent commands:",
+    "approve <id> — approve data access request",
+    "deny <id>    — deny data access request",
   ].join("\n");
 }

@@ -1,0 +1,87 @@
+# docker-compose.yml — Local testing and production deployment for leaf bot
+#
+# Usage:
+#   docker compose up -d              # Start in background
+#   docker compose logs -f            # Watch logs
+#   docker compose down               # Stop
+#   docker compose build --no-cache   # Rebuild from scratch
+
+services:
+  leaf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: leaf-bot
+    restart: unless-stopped
+
+    # Environment variables
+    environment:
+      # Required: Choose transport (telegram or whatsapp)
+      - TRANSPORT=${TRANSPORT:-whatsapp}
+
+      # Required for WhatsApp: Your phone number with country code
+      - WA_OWNER_PHONE=${WA_OWNER_PHONE}
+
+      # Required for Telegram (if using Telegram transport)
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN:-}
+      - TG_CHAT_ID=${TG_CHAT_ID:-}
+
+      # Timezone
+      - TZ=${TZ:-Asia/Kolkata}
+
+    # Volume mounts for persistent data
+    volumes:
+      # Bot data (logs, state, sessions)
+      - leaf-data:/app/data
+
+      # WhatsApp authentication (QR scan state)
+      - wa-auth:/app/wa-auth
+
+      # User home for pi agent sessions (optional: mount your existing .pi)
+      - ${HOME}/.pi:/home/nodejs/.pi:rw
+
+      # Environment file (alternative to env vars above)
+      - ./.env:/app/.env:ro
+
+      # Privacy config
+      - ./privacy.config.ts:/app/privacy.config.ts:ro
+
+    # Resource limits (adjust based on your server)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "node", "-e", "console.log('healthy')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service"
+        env: "TRANSPORT"
+
+# Named volumes for persistent data
+volumes:
+  leaf-data:
+    driver: local
+  wa-auth:
+    driver: local
+
+# Network (isolated)
+networks:
+  default:
+    driver: bridge

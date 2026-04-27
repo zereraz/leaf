@@ -1,0 +1,123 @@
+# docker-compose.prod.yml — Production deployment
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml logs -f
+#
+# Before deploying:
+#   1. Set all environment variables in .env.prod
+#   2. Ensure privacy.config.ts is production-ready
+#   3. Run: docker compose -f docker-compose.prod.yml pull
+
+services:
+  leaf:
+    # Use pre-built image from registry (recommended for production)
+    # image: your-registry/leaf-bot:latest
+
+    # Or build locally
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+
+    container_name: leaf-bot-prod
+    hostname: leaf-bot
+
+    # Always restart unless explicitly stopped
+    restart: always
+
+    # Production environment
+    environment:
+      - NODE_ENV=production
+      - TRANSPORT=${TRANSPORT}
+      - WA_OWNER_PHONE=${WA_OWNER_PHONE}
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
+      - TG_CHAT_ID=${TG_CHAT_ID}
+      - TWILIO_SID=${TWILIO_SID:-}
+      - TWILIO_TOKEN=${TWILIO_TOKEN:-}
+      - TWILIO_WHATSAPP_NUMBER=${TWILIO_WHATSAPP_NUMBER:-}
+      - TWILIO_OWNER_NUMBER=${TWILIO_OWNER_NUMBER:-}
+      - TZ=${TZ:-UTC}
+
+    # Production volumes
+    volumes:
+      # Named volumes for data persistence
+      - leaf-prod-data:/app/data
+      - leaf-prod-auth:/app/wa-auth
+
+      # Mount pi agent sessions from host
+      - leaf-pi-home:/home/nodejs/.pi:rw
+
+      # Config files (read-only)
+      - ./privacy.config.ts:/app/privacy.config.ts:ro
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+    # Read-only root filesystem (extra security)
+    read_only: true
+
+    # Tmpfs for temporary files
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+
+    # Resource limits (adjust based on load)
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+      # Rolling update strategy
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: pause
+        order: stop-first
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "node", "-e", "console.log('healthy')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # Logging to cloudwatch or local files
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+        compress: "true"
+        labels: "service,environment"
+        env: "TRANSPORT,NODE_ENV"
+
+    # Networks
+    networks:
+      - leaf-network
+
+# Named volumes
+volumes:
+  leaf-prod-data:
+    driver: local
+  leaf-prod-auth:
+    driver: local
+  leaf-pi-home:
+    driver: local
+
+# Isolated network
+networks:
+  leaf-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

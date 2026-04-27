@@ -1,7 +1,7 @@
 /**
  * subagent.ts — spawn focused background agents for tasks.
  *
- * Sub-agents run independently, send Telegram updates directly to saheb,
+ * Sub-agents run independently, send updates directly to the user,
  * and don't block the main conversation thread.
  */
 import { join } from "node:path";

@@ -2,6 +2,7 @@
  * config.ts — single source of truth for all configuration.
  * Env vars override defaults where applicable.
  */
+import "dotenv/config";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +16,20 @@ export const TG = {
   get apiBase() { return `https://api.telegram.org/bot${this.botToken}`; },
   pollTimeoutSecs: 30,
   maxMessageLen: 4000,
+} as const;
+
+export const WA = {
+  /** WhatsApp owner phone number (with country code, e.g., "919876543210") */
+  ownerPhone: process.env["WA_OWNER_PHONE"] ?? "",
+  /** Directory to store WhatsApp auth state */
+  authStateDir: join(LEAF_HOME, "wa-auth"),
+} as const;
+
+export const TWILIO = {
+  accountSid: process.env["TWILIO_SID"] ?? "",
+  authToken: process.env["TWILIO_TOKEN"] ?? "",
+  fromNumber: process.env["TWILIO_WHATSAPP_NUMBER"] ?? "", // Your Twilio WhatsApp number
+  ownerNumber: process.env["TWILIO_OWNER_NUMBER"] ?? "",   // Your personal WhatsApp
 } as const;
 
 export const PATHS = {
